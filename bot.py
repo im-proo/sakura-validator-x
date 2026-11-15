@@ -125,7 +125,10 @@ async def on_startup(bot: Bot) -> None:
     cluster = await api_manager.cluster_summary()
     logger.info(
         "startup complete: users=%s apis=%s online=%s/%s",
-        await database.count_users(), cluster["total"], cluster["online"], cluster["total"],
+        await database.count_users(),
+        cluster["total"],
+        cluster["online"],
+        cluster["total"],
     )
 
 
@@ -148,24 +151,35 @@ async def main() -> int:
 
     bot = Bot(
         token=config.settings.bot_token,
-        default=DefaultBotProperties(parse_mode=None, link_preview_is_disabled=True),
+        default=DefaultBotProperties(
+            parse_mode=None,
+            link_preview_is_disabled=True,
+        ),
     )
+
     dp = build_dispatcher()
 
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     try:
-    await bot.delete_webhook(drop_pending_updates=True)
-except Exception as exc:
-    logger.warning("delete_webhook failed: %s", exc)
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as exc:
+        logger.warning("delete_webhook failed: %s", exc)
 
-await webserver.start()
+    # Start webserver independently of webhook deletion
+    await webserver.start()
 
-try:
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-finally:
-    await bot.session.close()
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+        )
+    finally:
+        await bot.session.close()
+
+    return 0
+
 
 if __name__ == "__main__":
     try:
@@ -173,3 +187,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("stopped by keyboard interrupt")
         sys.exit(0)
+
+
