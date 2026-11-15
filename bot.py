@@ -160,15 +160,12 @@ async def main() -> int:
 except Exception as exc:
     logger.warning("delete_webhook failed: %s", exc)
 
-# Start webserver regardless of webhook result
 await webserver.start()
 
 try:
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 finally:
     await bot.session.close()
-
-return 0
 
 if __name__ == "__main__":
     try:
