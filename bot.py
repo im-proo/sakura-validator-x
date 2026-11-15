@@ -156,18 +156,19 @@ async def main() -> int:
     dp.shutdown.register(on_shutdown)
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as exc:
-        logger.warning("delete_webhook failed: %s", exc)
-        
-        await webserver.start()
+    await bot.delete_webhook(drop_pending_updates=True)
+except Exception as exc:
+    logger.warning("delete_webhook failed: %s", exc)
 
-    try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
-    finally:
-        await bot.session.close()
-    return 0
+# Start webserver regardless of webhook result
+await webserver.start()
 
+try:
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+finally:
+    await bot.session.close()
+
+return 0
 
 if __name__ == "__main__":
     try:
