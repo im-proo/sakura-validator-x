@@ -15,6 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 import config
+import webserver
 import core.api_manager as api_manager
 import core.checker_api as checker_api
 import core.database as database
@@ -158,6 +159,8 @@ async def main() -> int:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as exc:
         logger.warning("delete_webhook failed: %s", exc)
+        
+        await webserver.start()
 
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
