@@ -21,5 +21,5 @@ RUN useradd --create-home --uid 10001 sakura \
 USER sakura
 
 # Configuration comes from the environment — never bake .env into the image.
-# Required: BOT_TOKEN, MONGO_URI, OWNER_ID
+# Required: BOT_TOKEN, MONGO_URI. Everything else is hardcoded in config.py.
 CMD ["python", "bot.py"]

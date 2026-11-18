@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -15,7 +17,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 import config
-import webserver
 import core.api_manager as api_manager
 import core.checker_api as checker_api
 import core.database as database
@@ -47,6 +48,23 @@ from services import file_service
 
 logger = logging.getLogger("sakura")
 
+
+class JsonLogFormatter(logging.Formatter):
+    """One JSON object per line: ts, level, logger, message (+ traceback)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["error"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
 COMMANDS = [
     BotCommand(command="start", description="ᴏᴘᴇɴ ᴛʜᴇ ʙᴏᴛ"),
     BotCommand(command="check", description="sᴛᴀʀᴛ ᴄʜᴇᴄᴋɪɴɢ"),
@@ -59,13 +77,20 @@ COMMANDS = [
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=getattr(logging, config.settings.log_level, logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    logging.getLogger("aiogram.event").setLevel(logging.WARNING)
-    logging.getLogger("pymongo").setLevel(logging.WARNING)
+    level = getattr(logging, config.settings.log_level, logging.INFO)
+    if config.settings.log_json:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JsonLogFormatter())
+        logging.basicConfig(level=level, handlers=[handler], force=True)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            force=True,
+        )
+    for noisy in ("aiogram.event", "pymongo", "apscheduler"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def build_dispatcher() -> Dispatcher:
@@ -125,10 +150,7 @@ async def on_startup(bot: Bot) -> None:
     cluster = await api_manager.cluster_summary()
     logger.info(
         "startup complete: users=%s apis=%s online=%s/%s",
-        await database.count_users(),
-        cluster["total"],
-        cluster["online"],
-        cluster["total"],
+        await database.count_users(), cluster["total"], cluster["online"], cluster["total"],
     )
 
 
@@ -145,18 +167,15 @@ async def main() -> int:
 
     if not config.settings.is_configured:
         logger.error(
-            "BOT_TOKEN and MONGO_URI must be set in .env — copy .env.example and fill it in"
+            "BOT_TOKEN and MONGO_URI must be set in the environment or .env — "
+            "everything else lives in config.py"
         )
         return 1
 
     bot = Bot(
         token=config.settings.bot_token,
-        default=DefaultBotProperties(
-            parse_mode=None,
-            link_preview_is_disabled=True,
-        ),
+        default=DefaultBotProperties(parse_mode=None, link_preview_is_disabled=True),
     )
-
     dp = build_dispatcher()
 
     dp.startup.register(on_startup)
@@ -167,17 +186,10 @@ async def main() -> int:
     except Exception as exc:
         logger.warning("delete_webhook failed: %s", exc)
 
-    # Start webserver independently of webhook deletion
-    await webserver.start()
-
     try:
-        await dp.start_polling(
-            bot,
-            allowed_updates=["message", "callback_query"],
-        )
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await bot.session.close()
-
     return 0
 
 
@@ -187,5 +199,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("stopped by keyboard interrupt")
         sys.exit(0)
-
-

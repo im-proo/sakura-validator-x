@@ -34,7 +34,14 @@ from aiogram.types import (
 )
 from aiogram.types import RichTextUrl
 
-from models.schemas import daily_limit, max_cookies, plan_limits, utcnow
+from models.schemas import (
+    daily_limit,
+    max_cookies,
+    plan_limits,
+    remaining_label,
+    truthy,
+    utcnow,
+)
 from ui.states import cold_state_guard
 from ui.typography import (
     BOT_NAME_DISPLAY,
@@ -628,11 +635,8 @@ def _hit_rows(hit: dict[str, Any]) -> list[list[RichBlockTableCell]]:
     )
     profiles = account.get("profiles") or []
     profile_text = ", ".join(str(p) for p in profiles) if profiles else NONE_LABEL
-    hold = bool(account.get("is_on_hold")) or str(account.get("hold_status", "")).lower() in (
-        "yes",
-        "true",
-    )
-    extra = str(account.get("extra_member", "")).lower() in ("yes", "true")
+    hold = truthy(account.get("is_on_hold")) or truthy(account.get("hold_status"))
+    extra = truthy(account.get("extra_member"))
 
     country_text = cold_state_guard(account.get("country"), DASH)
     return [
@@ -650,7 +654,7 @@ def _hit_rows(hit: dict[str, Any]) -> list[list[RichBlockTableCell]]:
         [label("price"), value(account.get("price"))],
         [label("hold"), cell(YES if hold else NO)],
         [label("extra"), cell(YES if extra else NO)],
-        [label("verified"), cell(yes_no(account.get("email_verified")))],
+        [label("verified"), cell(yes_no(truthy(account.get("email_verified"))))],
         [label("status"), value(account.get("membership_status"))],
         [label("profiles"), cell(truncate(profile_text, 30))],
         [label("guid"), cell(code(cold_state_guard(account.get("user_guid"), DASH)))],
@@ -658,7 +662,7 @@ def _hit_rows(hit: dict[str, Any]) -> list[list[RichBlockTableCell]]:
             label("valid till"),
             cell(
                 f"{cold_state_guard(account.get('valid_till_utc') or account.get('valid_till'), DASH)}"
-                f" ({cold_state_guard(account.get('remaining'), DASH)})"
+                f" ({cold_state_guard(remaining_label(account), DASH)})"
             ),
         ],
     ]

@@ -143,6 +143,51 @@ class SessionStats:
         return min(100, int(100 * self.checked / self.total))
 
 
+def truthy(value: Any) -> bool:
+    """True for real booleans and for the API's "yes"/"true"/"1" strings."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("yes", "true", "1", "y", "on")
+
+
+def cookie_text(hit: dict[str, Any]) -> str:
+    """The raw cookie line, whether the API sends a string or a CookieSet."""
+    cookie = hit.get("cookie")
+    if isinstance(cookie, str):
+        return cookie.strip()
+    if isinstance(cookie, dict):
+        raw = str(cookie.get("raw") or "").strip()
+        if raw:
+            return raw
+        parts: list[str] = []
+        if cookie.get("netflix_id"):
+            parts.append(f"NetflixId={cookie['netflix_id']}")
+        if cookie.get("secure_netflix_id"):
+            parts.append(f"SecureNetflixId={cookie['secure_netflix_id']}")
+        if cookie.get("nfvdid"):
+            parts.append(f"nfvdid={cookie['nfvdid']}")
+        return "; ".join(parts)
+    return str(cookie or "").strip()
+
+
+def remaining_label(account: dict[str, Any]) -> str:
+    """Validity left: the API's hours/minutes split, or a ready-made label."""
+    ready = str(account.get("remaining") or "").strip()
+    if ready:
+        return ready
+    hours = account.get("remaining_hours")
+    minutes = account.get("remaining_minutes")
+    if hours is None and minutes is None:
+        return ""
+    whole_hours = int(hours or 0)
+    whole_minutes = int(minutes or 0)
+    if whole_hours <= 0 and whole_minutes <= 0:
+        return "0m"
+    return f"{whole_hours}h {whole_minutes:02d}m"
+
+
 def hit_identity(hit: dict[str, Any]) -> str:
     """Stable key so one account is never delivered twice."""
     account = hit.get("account") or {}
@@ -152,13 +197,21 @@ def hit_identity(hit: dict[str, Any]) -> str:
     guid = str(account.get("user_guid") or "").strip()
     if guid:
         return f"guid:{guid}"
-    return f"cookie:{str(hit.get('cookie') or '')[:64]}"
+    return f"cookie:{cookie_text(hit)[:64]}"
 
 
 def is_premium_hit(hit: dict[str, Any]) -> bool:
-    """A hit counts as premium when the account's plan is not the ad tier."""
+    """Premium unless the checker flags an ads tier.
+
+    The Go API reports both a display `plan` ("Premium") and a machine
+    `plan_type` ("premium"/"standard_with_ads"), plus `is_ads_tier`, so all
+    three are considered before falling back to a free hit.
+    """
     account = hit.get("account") or {}
     if account.get("is_premium") is True:
         return True
+    if truthy(account.get("is_ads_tier")):
+        return False
     plan = str(account.get("plan") or "").strip().lower()
-    return "premium" in plan or "ultimate" in plan
+    plan_type = str(account.get("plan_type") or "").strip().lower()
+    return "premium" in plan or "ultimate" in plan or plan_type == "premium"

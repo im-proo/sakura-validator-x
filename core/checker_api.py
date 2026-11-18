@@ -112,8 +112,12 @@ async def submit_job_file(
         filename=file_name,
         content_type="application/octet-stream",
     )
-    form.add_field("concurrency", str(int(concurrency)))
-    form.add_field("rate_per_minute", str(int(rate_per_minute)))
+    # Only override the checker's own defaults when explicitly configured:
+    # the Go API falls back to 1 worker if concurrency is sent as 0.
+    if int(concurrency) > 0:
+        form.add_field("concurrency", str(int(concurrency)))
+    if int(rate_per_minute) > 0:
+        form.add_field("rate_per_minute", str(int(rate_per_minute)))
     form.add_field("retry_on_proxy", "true")
 
     try:
@@ -145,12 +149,14 @@ async def submit_job_json(
     rate_per_minute: int = 0,
 ) -> dict[str, Any]:
     """POST /api/v1/jobs as JSON when cookies are already split."""
-    payload = {
+    payload: dict[str, Any] = {
         "cookies": list(cookies),
-        "concurrency": int(concurrency),
-        "rate_per_minute": int(rate_per_minute),
         "retry_on_proxy": True,
     }
+    if int(concurrency) > 0:
+        payload["concurrency"] = int(concurrency)
+    if int(rate_per_minute) > 0:
+        payload["rate_per_minute"] = int(rate_per_minute)
     try:
         async with _get_session().post(
             f"{_base(api_url)}{API_PREFIX}/jobs",
@@ -174,7 +180,7 @@ async def get_job_status(api_url: str, job_id: str) -> dict[str, Any]:
     try:
         async with _get_session().get(
             f"{_base(api_url)}{API_PREFIX}/jobs/{job_id}",
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             body = await _read_json(resp)
             if resp.status == 404:
@@ -207,7 +213,7 @@ async def get_job_hits(
         async with _get_session().get(
             f"{_base(api_url)}{API_PREFIX}/jobs/{job_id}/hits",
             params=params,
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             body = await _read_json(resp)
             if resp.status != 200:

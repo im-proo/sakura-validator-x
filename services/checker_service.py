@@ -11,7 +11,6 @@ never refunded once the job is running (Section 14).
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import time
 from dataclasses import dataclass, field
@@ -27,8 +26,8 @@ import core.checker_api as checker_api
 import core.database as database
 from models.schemas import (
     SessionStats,
-    concurrency as plan_concurrency,
     hit_identity,
+    truthy,
     is_premium_hit,
     utcnow,
 )
@@ -42,7 +41,7 @@ POLL_INTERVAL = 3.0
 MIN_EDIT_INTERVAL = 3.0
 MAX_PAGES_PER_SWEEP = 20
 HITS_PAGE_SIZE = 100
-TRANSIENT_RETRIES = 3
+TRANSIENT_RETRIES = 5
 
 
 @dataclass
@@ -120,7 +119,7 @@ def _login_token(hit: dict[str, Any]) -> dict[str, Any]:
     return {k: hit[k] for k in ("phone_link", "pc_link", "tv_link") if hit.get(k)}
 
 
-async def _send_hit(bot: Bot, session: CheckSession, hit: dict[str, Any]) -> None:
+async def _send_hit(bot: Bot, session: CheckSession, hit: dict[str, Any]) -> bool:
     """One message per hit: the card, the login buttons and the cookie file.
 
     The .txt is embedded as a quoted document block inside the card, so the
@@ -129,7 +128,7 @@ async def _send_hit(bot: Bot, session: CheckSession, hit: dict[str, Any]) -> Non
     """
     account = hit.get("account") or {}
     if not account:
-        return
+        return False
 
     file_name = file_service.hit_file_name(hit)
     document = BufferedInputFile(
@@ -145,15 +144,16 @@ async def _send_hit(bot: Bot, session: CheckSession, hit: dict[str, Any]) -> Non
         )
     except Exception as exc:
         logger.error("hit card send failed session=%s: %s", session.session_id, exc)
-        return
+        return False
 
     session.delivered.append(hit)
     if is_premium_hit(hit):
         session.stats.premium += 1
-    else:
-        session.stats.free += 1
+    if truthy(account.get("is_on_hold")) or truthy(account.get("hold_status")):
+        session.stats.hold += 1
 
     await forward_hit(bot, sent.message_id, session.chat_id)
+    return True
 
 
 async def forward_hit(bot: Bot, message_id: int, from_chat_id: int) -> None:
@@ -197,9 +197,11 @@ async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
             identity = hit_identity(hit)
             if identity in session.stats.sent_hits:
                 continue
-            session.stats.sent_hits.add(identity)
-            await _send_hit(bot, session, hit)
-            seen += 1
+            # Only mark delivered once Telegram accepted the card, so a failed
+            # send is retried on the next sweep instead of being lost.
+            if await _send_hit(bot, session, hit):
+                session.stats.sent_hits.add(identity)
+                seen += 1
 
         total_pages = int(payload.get("total_pages") or 1)
         if page >= total_pages:
@@ -218,7 +220,8 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
                 api_url=session.api_url,
                 file_path=file_path,
                 file_name=file_name,
-                concurrency=max(100, plan_concurrency(session.plan) * 100),
+                concurrency=config.settings.checker_concurrency,
+                rate_per_minute=config.settings.checker_rate_per_minute,
             )
         except checker_api.CheckerAPIError as exc:
             logger.error("job submit failed session=%s: %s", session.session_id, exc)
@@ -308,14 +311,18 @@ def _apply_status(session: CheckSession, status: dict[str, Any]) -> None:
     """Fold one poll payload into the session counters."""
     session.stats.checked = int(status.get("checked") or 0)
     session.stats.hits = int(status.get("hits") or 0)
-    session.stats.bad = int(status.get("bad") or 0)
+    # The Go API counts non-hits as "expired" and exposes RPM as "current_rpm".
+    session.stats.bad = int(status.get("expired") or status.get("bad") or 0)
     session.stats.errors = int(status.get("errors") or 0)
     session.stats.hold = int(status.get("hold") or 0)
-    session.stats.cpm = float(status.get("cpm") or 0.0)
+    session.stats.cpm = float(status.get("current_rpm") or status.get("cpm") or 0.0)
     total = int(status.get("total") or session.stats.total or 0)
     if total:
         session.stats.total = total
         session.total = total
+    # Free = everything the API counted as a hit that is not premium, so the
+    # valid / premium / free rows always add up.
+    session.stats.free = max(0, session.stats.hits - session.stats.premium)
 
 
 async def _finalize(bot: Bot, session: CheckSession) -> None:
@@ -354,11 +361,12 @@ async def _finalize(bot: Bot, session: CheckSession) -> None:
 async def _send_file(bot: Bot, chat_id: int, path: str, file_name: str) -> None:
     try:
         with open(path, "rb") as handle:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=io.BytesIO(handle.read()),
-                filename=file_name,
-            )
+            payload = handle.read()
+        # aiogram takes the filename on the InputFile, not as a keyword.
+        await bot.send_document(
+            chat_id=chat_id,
+            document=BufferedInputFile(payload, filename=file_name),
+        )
     except Exception as exc:
         logger.error("result file send failed: %s", exc)
 
@@ -415,8 +423,14 @@ async def create_session(
     return session
 
 
-def launch(bot: Bot, session: CheckSession, file_info: dict[str, Any]) -> None:
-    """Start polling in the background."""
+async def launch(bot: Bot, session: CheckSession, file_info: dict[str, Any]) -> None:
+    """Start the check loop in the background.
+
+    run_check is a coroutine, so launch() must be async and use
+    create_task; a plain def would schedule a coroutine object that never
+    runs and the check would never start (the "can't fetch cookies from a zip"
+    symptom).
+    """
     asyncio.create_task(
         run_check(bot, session, file_info["file_path"], file_info["file_name"]),
         name=f"check:{session.session_id}",

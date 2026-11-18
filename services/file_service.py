@@ -1,14 +1,22 @@
 """Cookie file intake and hit artefacts.
 
 The Go checker accepts .txt/.json/.zip/.rar itself, so the bot only has to
-download the upload, sanity-check the format and estimate the cookie count
+download the upload, sniff the container type and estimate the cookie count
 to enforce plan limits. Cookie bytes never touch MongoDB.
+
+The pre-flight is deliberately conservative: it only rejects an upload when
+it is *certain* there is nothing to check (an empty file, or plain text that
+mentions Netflix nowhere). Anything wrapped, renamed or unreadable is handed
+to the checker, whose magic-byte sniffing knows more about archives than we
+do. A false "no cookies" here would reject a good file before the API ever
+sees it.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 import zipfile
 from typing import Any
@@ -16,6 +24,7 @@ from typing import Any
 import aiofiles
 
 import config
+from models.schemas import cookie_text, remaining_label, truthy
 from ui.typography import BOT_NAME_DISPLAY, BRAND_FOOTER
 
 logger = logging.getLogger(__name__)
@@ -57,8 +66,126 @@ def safe_temp_path(file_name: str) -> str:
     return os.path.join(temp_dir(), f"sakura_{uuid.uuid4().hex[:12]}_{stem}")
 
 
+NETFLIX_ID_RE = re.compile(rb"(?<!Secure)NetflixId", re.IGNORECASE)
+NETFLIX_WORD_RE = re.compile(rb"netflix", re.IGNORECASE)
+NETFLIX_MARKER_BYTES = NETFLIX_MARKER.encode()
+
+# Magic bytes of every container the Go checker can unpack itself.
+ARCHIVE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"PK\x03\x04", "zip"),
+    (b"PK\x05\x06", "zip"),
+    (b"PK\x07\x08", "zip"),
+    (b"Rar!\x1a\x07", "rar"),
+    (b"\x1f\x8b", "gzip"),
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"BZh", "bzip2"),
+)
+OPAQUE_KINDS = ("rar", "gzip", "7z", "bzip2")
+
+
+def sniff_kind(header: bytes) -> str:
+    """Container type from magic bytes — the test the Go extractor uses."""
+    for magic, kind in ARCHIVE_MAGIC:
+        if header.startswith(magic):
+            return kind
+    return ""
+
+
+def resolve_kind(path: str, ext: str) -> str:
+    """Real container type: trust the bytes first, then the extension."""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return ext
+    return sniff_kind(header) or ext
+
+
+def is_text_bytes(data: bytes) -> bool:
+    """False for binary payloads (NUL bytes or mostly non-printable data)."""
+    if b"\x00" in data:
+        return False
+    sample = data[:4096]
+    if not sample:
+        return True
+    printable = sum(1 for byte in sample if 32 <= byte < 127 or byte in (9, 10, 13))
+    return printable / len(sample) > 0.85
+
+
+def _count_in_text(data: bytes) -> int:
+    """One NetflixId per cookie set; SecureNetflixId must not be counted."""
+    return len(NETFLIX_ID_RE.findall(data))
+
+
+def _count_in_zip(path: str) -> int | None:
+    """Cookie sets inside a readable zip, or None when it cannot be judged."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            total = 0
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                try:
+                    with archive.open(info) as member:
+                        chunk = member.read(ZIP_SCAN_LIMIT)
+                except (RuntimeError, zipfile.BadZipFile, OSError):
+                    # Encrypted or damaged member: the API may still read it.
+                    return None
+                if not is_text_bytes(chunk):
+                    # Nested archive / binary blob — leave it to the checker.
+                    return None
+                total += _count_in_text(chunk)
+            return total
+    except (zipfile.BadZipFile, OSError):
+        return None
+
+
+def count_netflix_cookies(path: str, ext: str) -> int | None:
+    """Cookie sets in the upload, or None when only the API can tell.
+
+    0 is returned only when the file is plain text we could read in full and
+    it contains no NetflixId *and* no mention of Netflix at all. Every other
+    uncertain case — renamed zip, nested archive, rar/gzip/7z, binary or
+    unreadable payload — returns None and is submitted as-is, because the Go
+    extractor sniffs magic bytes and supports layouts this module does not.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size == 0:
+        return 0
+
+    kind = resolve_kind(path, ext)
+    if kind == "zip":
+        return _count_in_zip(path)
+    if kind in OPAQUE_KINDS:
+        return None
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(ZIP_SCAN_LIMIT)
+    except OSError:
+        return None
+    if not is_text_bytes(data):
+        return None
+
+    found = _count_in_text(data)
+    if found:
+        return found
+    # No “NetflixId” but the file talks about Netflix: some layout we do not
+    # model (escaped keys, wrapped values) — the checker decides.
+    if NETFLIX_WORD_RE.search(data):
+        return None
+    return 0
+
+
 def estimate_cookie_count(path: str, ext: str) -> int:
-    """Best-effort count used only for the plan limit check."""
+    """Best-effort count used only for the plan limit check.
+
+    Never rejects an unreadable or renamed archive: a broken zip still gets
+    a size-based estimate so the API can sniff it and answer for itself.
+    """
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -66,44 +193,49 @@ def estimate_cookie_count(path: str, ext: str) -> int:
     if size == 0:
         raise InvalidFileError("file is empty")
 
-    if ext == "txt":
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            content = handle.read()
-        occurrences = content.count(NETFLIX_MARKER)
-        if occurrences == 0:
-            # Not a Netflix export: fall back to non-empty line count.
-            lines = [ln for ln in content.splitlines() if ln.strip()]
-            if not lines:
-                raise InvalidFileError("file contains no cookies")
-            return max(1, len(lines))
-        return max(1, occurrences // COOKIE_LINES_PER_SET)
+    kind = resolve_kind(path, ext)
 
-    if ext == "json":
-        # The API parses JSON itself; only the size is needed for the limit.
-        return max(1, size // 1_000)
-
-    if ext == "zip":
+    if kind == "zip":
         try:
             with zipfile.ZipFile(path) as archive:
                 total_marker = 0
                 scanned = 0
                 for info in archive.infolist():
-                    if info.is_dir() or not info.filename.lower().endswith((".txt", ".json")):
+                    if info.is_dir() or not info.filename.lower().endswith(
+                        (".txt", ".json", ".csv")
+                    ):
                         continue
                     if scanned >= ZIP_SCAN_LIMIT:
                         break
                     with archive.open(info) as member:
                         chunk = member.read()
                     scanned += len(chunk)
-                    total_marker += chunk.count(NETFLIX_MARKER.encode())
+                    total_marker += chunk.count(NETFLIX_MARKER_BYTES)
                 if total_marker:
                     return max(1, total_marker // COOKIE_LINES_PER_SET)
-        except zipfile.BadZipFile as exc:
-            raise InvalidFileError("zip archive looks broken") from exc
+        except (zipfile.BadZipFile, OSError):
+            # Renamed or damaged archive: fall through to a size estimate.
+            pass
         return max(1, size // 800)
 
-    # .rar: no stdlib reader; estimate from compressed size.
-    return max(1, size // 800)
+    if kind in OPAQUE_KINDS:
+        # No stdlib reader for these; compressed size is all we have.
+        return max(1, size // 800)
+
+    if kind == "json":
+        # The API parses JSON itself; only the size is needed for the limit.
+        return max(1, size // 1_000)
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+        content = handle.read()
+    occurrences = content.count(NETFLIX_MARKER)
+    if occurrences == 0:
+        # Not a Netflix export: fall back to non-empty line count.
+        lines = [ln for ln in content.splitlines() if ln.strip()]
+        if not lines:
+            raise InvalidFileError("file contains no cookies")
+        return max(1, len(lines))
+    return max(1, occurrences // COOKIE_LINES_PER_SET)
 
 
 async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dict[str, Any]:
@@ -113,10 +245,6 @@ async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dic
     """
     file_name = str(getattr(document, "file_name", "") or "cookies.txt")
     ext = extension_of(file_name)
-    if ext not in ALLOWED_EXTENSIONS:
-        raise InvalidFileError(
-            "only .txt, .json, .zip and .rar files are accepted"
-        )
 
     file_size = int(getattr(document, "file_size", 0) or 0)
     if file_size > 50 * 1024 * 1024:
@@ -131,11 +259,33 @@ async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dic
         _silent_remove(local_path)
         raise InvalidFileError("could not download the file, please resend it") from exc
 
+    # The extension is a hint, never a verdict: the checker sniffs the bytes.
+    kind = resolve_kind(local_path, ext)
+    if ext not in ALLOWED_EXTENSIONS and kind not in (
+        "txt", "json", "zip", "rar", *OPAQUE_KINDS
+    ):
+        _silent_remove(local_path)
+        raise InvalidFileError("only .txt, .json, .zip and .rar files are accepted")
+
     try:
         estimated = estimate_cookie_count(local_path, ext)
     except InvalidFileError:
         _silent_remove(local_path)
         raise
+    except OSError as exc:
+        _silent_remove(local_path)
+        raise InvalidFileError("could not read the file, please resend it") from exc
+
+    found = count_netflix_cookies(local_path, ext)
+    if found == 0:
+        # Certain: plain text that never mentions Netflix.
+        _silent_remove(local_path)
+        raise InvalidFileError(
+            "this file has no Netflix cookies inside it - export the cookies "
+            "again (.txt, or a .zip of .txt files) and send it"
+        )
+    if found:
+        estimated = max(estimated, found)
 
     if estimated > plan_max:
         _silent_remove(local_path)
@@ -148,7 +298,7 @@ async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dic
     return {
         "file_path": local_path,
         "file_name": file_name,
-        "extension": ext,
+        "extension": kind,
         "estimated_count": estimated,
         "file_size": file_size,
     }
@@ -166,12 +316,9 @@ def build_hit_text(hit: dict[str, Any]) -> str:
     account = hit.get("account") or {}
     profiles = account.get("profiles") or []
     profile_text = ", ".join(str(p) for p in profiles) if profiles else "—"
-    hold = bool(account.get("is_on_hold")) or str(account.get("hold_status", "")).lower() in (
-        "yes",
-        "true",
-    )
-    extra = str(account.get("extra_member", "")).lower() in ("yes", "true")
-    verified = bool(account.get("email_verified"))
+    hold = truthy(account.get("is_on_hold")) or truthy(account.get("hold_status"))
+    extra = truthy(account.get("extra_member"))
+    verified = truthy(account.get("email_verified"))
 
     lines = [
         "✅ NETFLIX HIT",
@@ -195,11 +342,11 @@ def build_hit_text(hit: dict[str, Any]) -> str:
         f"Profiles: {profile_text}",
         f"User GUID: {_value(account, 'user_guid', '—')}",
         f"Valid Till (UTC): {_value(account, 'valid_till_utc', _value(account, 'valid_till', '—'))}"
-        f" (Remaining: {_value(account, 'remaining', '—')})",
+        f" (Remaining: {_value(account, 'remaining', remaining_label(account) or '—')})",
         "=" * 40,
         "",
         "🍪 Netflix COOKIE:",
-        str(hit.get("cookie") or "").strip(),
+        cookie_text(hit),
         "",
     ]
     return "\n".join(lines)
@@ -215,8 +362,8 @@ def hit_file_name(hit: dict[str, Any]) -> str:
 def bundle_file_names(kind: str) -> str:
     """Fixed names used for the end-of-run deliverables."""
     if kind == "zip":
-        return "𝐒𝐚𝐤𝐮𝐫𝐚_Premium_Hits.zip"
-    return "𝐒𝐚𝐤𝐮𝐫𝐚_Premium_Hits.txt"
+        return "premium_accounts.zip"
+    return "premium_accounts.txt"
 
 
 async def build_hits_bundle(hits: list[dict[str, Any]], token: str | None = None) -> dict[str, Any]:

@@ -152,7 +152,8 @@ def test_successful_run_delivers_hits_files_and_summary(tmp_path):
     assert session.stats.checked == 3
     assert session.stats.status == "done"
 
-    files = [d["filename"] for d in bot.documents]
+    # aiogram carries the name on the InputFile, not as a kwarg
+    files = [getattr(d.get("document"), "filename", "") for d in bot.documents]
     assert any(name.endswith(".zip") for name in files)
     assert any(name.endswith(".txt") for name in files)
     assert not os.path.exists(str(session.__dict__["_file"])), "upload must be cleaned up"
@@ -219,3 +220,44 @@ def test_zero_hit_completion_is_warm_not_cold(tmp_path):
 
     assert sc("no hits this run") in (text + joined)
     assert not any(d["filename"].endswith((".zip", ".txt")) for d in bot.documents)
+
+
+def test_status_fields_map_from_go_snapshot():
+    """Go exposes non-hits as `expired` and speed as `current_rpm`."""
+    from types import SimpleNamespace
+
+    from models.schemas import SessionStats
+
+    session = SimpleNamespace(stats=SessionStats())
+    cs._apply_status(
+        session,
+        {
+            "id": "job-1",
+            "status": "running",
+            "total": 10,
+            "checked": 4,
+            "hits": 1,
+            "expired": 3,
+            "errors": 0,
+            "duplicates": 0,
+            "current_rpm": 812.5,
+        },
+    )
+    assert session.stats.checked == 4
+    assert session.stats.hits == 1
+    assert session.stats.bad == 3
+    assert session.stats.cpm == 812.5
+
+
+def test_free_row_is_hits_minus_premium():
+    """valid = premium + free must always hold on the dashboard."""
+    from types import SimpleNamespace
+
+    from models.schemas import SessionStats
+
+    session = SimpleNamespace(stats=SessionStats())
+    session.stats.premium = 2
+    cs._apply_status(session, {"status": "running", "total": 10, "checked": 9, "hits": 5, "expired": 4})
+    assert session.stats.hits == 5
+    assert session.stats.premium == 2
+    assert session.stats.free == 3
