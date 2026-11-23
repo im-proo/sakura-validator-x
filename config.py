@@ -32,27 +32,6 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017").strip()
 OWNER_ID = 8900061448
 ADMIN_IDS = (8900061448,)
 
-# Channels every user must join before the bot works. They are gated even
-# when the Mongo `channels` collection is empty, and a row an admin disabled
-# in the panel always wins. Private channels need the bot as an admin so it
-# can read membership and mint an invite link.
-FORCE_JOIN_CHANNELS = (
-    "-1003791098639",
-    "-1003715365551",
-    "-1004445390575",
-    "-1003965937636",
-)
-
-# Join links for the channels above, used when Telegram will not hand one over
-# (private channel, or the bot is not an admin there). Add an invite link per
-# id; the bot also tries @username → chat invite link → fresh invite link.
-FORCE_JOIN_LINKS = {
-    "-1003791098639": "",
-    "-1003715365551": "",
-    "-1004445390575": "https://t.me/nyroxbots",
-    "-1003965937636": "",
-}
-
 # Database used when MONGO_URI does not name one in its path.
 MONGO_DB_DEFAULT = "sakura_validator_x"
 
