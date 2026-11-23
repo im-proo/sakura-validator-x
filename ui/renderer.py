@@ -36,8 +36,11 @@ from aiogram.types import RichTextUrl
 
 from models.schemas import (
     daily_limit,
+    known_text,
     max_cookies,
+    plan_display,
     plan_limits,
+    price_label,
     remaining_label,
     truthy,
     utcnow,
@@ -207,8 +210,13 @@ class Card:
                 blocks.append(InputRichBlockBlockQuotation(blocks=_inner_blocks(payload[0])))
             elif kind == "expandable":
                 text, credit = payload
+                # aiogram requires the expandable block's body as child blocks
+                # (a bare `text=` is rejected by the model).
                 blocks.append(
-                    InputRichBlockExpandableBlockQuotation(text=text, credit=credit)
+                    InputRichBlockExpandableBlockQuotation(
+                        blocks=[InputRichBlockParagraph(text=text)],
+                        credit=credit,
+                    )
                 )
             elif kind == "footer":
                 blocks.append(InputRichBlockFooter(text=payload))
@@ -593,8 +601,7 @@ def render_live_card(session: Any, finished: bool = False, video: str = "") -> I
         _status_row(status_text, accent=accent),
         [label("checked"), value(f"{fmt_num(stats.checked)}/{fmt_num(stats.total)}")],
         [label("cpm"), value(fmt_num(int(stats.cpm)))],
-        [label("valid"), value(fmt_num(stats.hits))],
-        [label("premium"), value(fmt_num(stats.premium))],
+        [label("hits"), value(fmt_num(stats.hits))],
         [label("free"), value(fmt_num(stats.free))],
         [label("bad"), value(fmt_num(stats.bad))],
         [label("error"), value(fmt_num(stats.errors))],
@@ -615,8 +622,8 @@ def render_live_card_html(session: Any, finished: bool = False) -> str:
                 _status_row(sc("finished") if finished else sc(stats.status or "running")),
                 [label("checked"), f"{fmt_num(stats.checked)}/{fmt_num(stats.total)}"],
                 [label("cpm"), fmt_num(int(stats.cpm))],
-                [label("valid"), fmt_num(stats.hits)],
-                [label("premium"), fmt_num(stats.premium)],
+                [label("hits"), fmt_num(stats.hits)],
+                [label("free"), fmt_num(stats.free)],
                 [label("bad"), fmt_num(stats.bad)],
                 [label("error"), fmt_num(stats.errors)],
                 [label("hold"), fmt_num(stats.hold)],
@@ -638,31 +645,33 @@ def _hit_rows(hit: dict[str, Any]) -> list[list[RichBlockTableCell]]:
     hold = truthy(account.get("is_on_hold")) or truthy(account.get("hold_status"))
     extra = truthy(account.get("extra_member"))
 
-    country_text = cold_state_guard(account.get("country"), DASH)
+    # Every field goes through known_text: the checker writes "Unknown" when
+    # a market's page does not carry a value, and the card must not print it.
+    country_text = known_text(account.get("country"), DASH)
     return [
-        [label("name"), value(account.get("name"))],
-        [label("email"), cell(code(cold_state_guard(account.get("email"), DASH)))],
+        [label("name"), value(known_text(account.get("name"), DASH))],
+        [label("email"), cell(code(known_text(account.get("email"), DASH)))],
         [label("country"), cell(f"{country_text} {flag}".strip())],
-        [label("plan"), value(account.get("plan"))],
-        [label("since"), value(account.get("member_since"))],
-        [label("billing"), value(account.get("next_billing"))],
-        [label("payment"), value(account.get("payment"))],
-        [label("card"), value(account.get("card"), NONE_LABEL)],
-        [label("phone"), value(account.get("phone"), NONE_LABEL)],
-        [label("quality"), value(account.get("video_quality") or account.get("quality"))],
+        [label("plan"), value(plan_display(account, DASH))],
+        [label("since"), value(known_text(account.get("member_since"), DASH))],
+        [label("billing"), value(known_text(account.get("next_billing"), DASH))],
+        [label("payment"), value(known_text(account.get("payment"), DASH))],
+        [label("card"), value(known_text(account.get("card"), NONE_LABEL), NONE_LABEL)],
+        [label("phone"), value(known_text(account.get("phone"), NONE_LABEL), NONE_LABEL)],
+        [label("quality"), value(known_text(account.get("video_quality") or account.get("quality"), DASH))],
         [label("streams"), value(account.get("streams"))],
-        [label("price"), value(account.get("price"))],
+        [label("price"), value(price_label(account, DASH))],
         [label("hold"), cell(YES if hold else NO)],
         [label("extra"), cell(YES if extra else NO)],
         [label("verified"), cell(yes_no(truthy(account.get("email_verified"))))],
-        [label("status"), value(account.get("membership_status"))],
+        [label("status"), value(known_text(account.get("membership_status"), DASH))],
         [label("profiles"), cell(truncate(profile_text, 30))],
-        [label("guid"), cell(code(cold_state_guard(account.get("user_guid"), DASH)))],
+        [label("guid"), cell(code(known_text(account.get("user_guid"), DASH)))],
         [
             label("valid till"),
             cell(
-                f"{cold_state_guard(account.get('valid_till_utc') or account.get('valid_till'), DASH)}"
-                f" ({cold_state_guard(remaining_label(account), DASH)})"
+                f"{known_text(account.get('valid_till_utc') or account.get('valid_till'), DASH)}"
+                f" ({known_text(remaining_label(account), DASH)})"
             ),
         ],
     ]
@@ -705,8 +714,8 @@ def render_complete_card(session: Any) -> InputRichMessage:
             [
                 [label("status"), cell(f"{sc('finished')} {S_STAR}")],
                 [label("checked"), value(fmt_num(stats.checked))],
-                [label("premium"), value(fmt_num(stats.premium))],
-                [label("valid"), value(fmt_num(stats.hits))],
+                [label("hits"), value(fmt_num(stats.hits))],
+                [label("free"), value(fmt_num(stats.free))],
                 [label("bad"), value(fmt_num(stats.bad))],
                 [label("duration"), value(stats.elapsed_label)],
             ]
@@ -730,8 +739,8 @@ def render_complete_card_html(session: Any) -> str:
             [
                 [label("status"), f"{sc('finished')} {S_STAR}"],
                 [label("checked"), fmt_num(stats.checked)],
-                [label("premium"), fmt_num(stats.premium)],
-                [label("valid"), fmt_num(stats.hits)],
+                [label("hits"), fmt_num(stats.hits)],
+                [label("free"), fmt_num(stats.free)],
                 [label("bad"), fmt_num(stats.bad)],
                 [label("duration"), stats.elapsed_label],
             ]

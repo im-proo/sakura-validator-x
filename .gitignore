@@ -11,3 +11,4 @@ venv/
 # runtime artefacts
 /tmp/
 *.zip
+bin/

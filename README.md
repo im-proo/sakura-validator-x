@@ -27,8 +27,8 @@ upload when the job ends.
   attempt limits, one-day free trials and redeemable keys.
 - **Multiple checker instances** — round-robin / priority / random rotation,
   health monitor, capacity reservation and automatic failover.
-- **Admin panel** — users, plans, keys, API instances, proxy uploads, channels,
-  videos, broadcast, runtime config and logs.
+- **Admin panel** — users, plans, keys, API instances, channels, videos,
+  broadcast, runtime config and logs.
 - **Hardcoded configuration** — two environment variables, everything else in
   `config.py`. JSON logs by default.
 
@@ -109,8 +109,7 @@ The bot stores instances in MongoDB (`apis` collection):
 | `priority` | `1` |
 
 Use **Admin → APIs** to add, edit, enable/disable and test them, or insert
-documents directly. Proxies are uploaded to the instances themselves
-(**Admin → APIs → proxies**), never to the bot.
+documents directly.
 
 ## Project layout
 
@@ -122,7 +121,7 @@ core/
   api_manager.py           instance rotation, health monitor, capacity
   database.py              motor collections, config defaults, audit log
   middlewares.py           ban, maintenance and force-join gates
-  scheduler.py             daily resets and housekeeping
+  scheduler.py             daily resets, housekeeping, stats snapshots
 handlers/                  user commands and the admin panel
 services/
   file_service.py          upload intake, hit text and result bundles

@@ -39,8 +39,9 @@ MONGO_DB_DEFAULT = "sakura_validator_x"
 MAX_CONCURRENT_GLOBAL = 50
 
 # Worker goroutines sent to the checker. 0 = omit, so the API's own
-# default (300 workers) is used.
-CHECKER_CONCURRENCY = 300
+# default (300 workers) is used. Without a proxy pool a small box cannot
+# feed 300 workers, so the bot asks for a modest number.
+CHECKER_CONCURRENCY = 50
 
 # Checks per minute per job. 0 = no rate limit.
 CHECKER_RATE_PER_MINUTE = 0

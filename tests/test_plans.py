@@ -10,7 +10,9 @@ from models.schemas import (
     concurrency,
     daily_limit,
     hit_identity,
+    is_ads_plan,
     is_premium_hit,
+    plan_family,
     max_cookies,
     next_midnight_utc,
     utcnow,
@@ -72,6 +74,49 @@ def test_premium_classification():
     assert is_premium_hit({"account": {"plan": "Standard"}}) is False
     assert is_premium_hit({"account": {"plan": "Basic"}}) is False
     assert is_premium_hit({"account": {"is_premium": True}}) is True
+
+
+def test_localized_plan_names_are_classified():
+    """Netflix localises plan names; none of them may fall through to unknown."""
+    assert plan_family("Padrão com anúncios") == "standard"
+    assert plan_family("Padrão") == "standard"
+    assert plan_family("Básico") == "basic"
+    assert plan_family("Estándar con anuncios") == "standard"
+    assert plan_family("Estándar") == "standard"
+    assert plan_family("Standard") == "standard"
+    assert plan_family("Premium") == "premium"
+    assert plan_family("" ) == ""
+
+    assert is_ads_plan("Padrão com anúncios") is True
+    assert is_ads_plan("Estándar con anuncios") is True
+    assert is_ads_plan("Standard with ads") is True
+    assert is_ads_plan("Básico") is False
+    assert is_ads_plan("Premium") is False
+
+    # Ad-supported tiers are valid sessions, never premium hits.
+    assert is_premium_hit({"account": {"plan": "Padrão com anúncios"}}) is False
+    assert is_premium_hit({"account": {"plan": "Básico"}}) is False
+    assert is_premium_hit({"account": {"plan": "Estándar con anuncios"}}) is False
+    assert is_premium_hit({"account": {"plan": "Básico com anúncios"}}) is False
+    # A localised Premium is still premium even without plan_type.
+    assert is_premium_hit({"account": {"plan": "Premium", "plan_type": "unknown"}}) is True
+
+
+def test_premium_is_recognised_in_every_locale():
+    """A Premium account must never be counted as a free account.
+
+    Accents and native scripts are the trap: Hungarian "Prémium" and
+    Vietnamese "Cao cấp" carry the same tier as "Premium".
+    """
+    for name in (
+        "Premium", "Prémium", "Premiun", "Премиум", "Преміум", "Премијум",
+        "Özel", "Cao cấp", "प्रीमियम", "พรีเมียม", "프리미엄", "プレミアム",
+        "بريميوم", "高级",
+    ):
+        assert plan_family(name) == "premium", name
+        assert is_premium_hit({"account": {"plan": name, "plan_type": "unknown"}}) is True, name
+        # Every one of them still has to survive the ads check.
+        assert is_ads_plan(name) is False, name
 
 
 def test_session_stats_progress_and_labels():

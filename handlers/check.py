@@ -265,7 +265,9 @@ async def _start_check(call: CallbackQuery, state: FSMContext, hit_mode: str) ->
     )
     session.message_id = dashboard.message_id
 
-    checker_service.launch(
+    # launch() is async: it schedules run_check with create_task, so it must
+    # be awaited or the coroutine never starts and the dashboard stays at 0.
+    await checker_service.launch(
         call.bot,
         session,
         {"file_path": file_path, "file_name": file_name},

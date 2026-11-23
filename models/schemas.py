@@ -7,6 +7,7 @@ and for expensive-to-recompute values. Nothing here performs I/O.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -109,6 +110,10 @@ class SessionStats:
     job_id: str = ""
     total: int = 0
     checked: int = 0
+    # Valid sessions the checker reported, before the premium split.
+    api_hits: int = 0
+    # Hits the bot delivers: premium accounts only. A free / basic / ads
+    # account is a valid session, not a hit, so it is counted in `free`.
     hits: int = 0
     premium: int = 0
     free: int = 0
@@ -119,6 +124,11 @@ class SessionStats:
     started_at: datetime = field(default_factory=utcnow)
     finished_at: datetime | None = None
     status: str = "running"
+    # Identities of every valid session classified so far. A hit is counted
+    # the moment it is fetched, not when its card is sent, so the live card
+    # never reports a Premium account as free while the message is in flight.
+    seen_hits: set[str] = field(default_factory=set)
+    # Identities whose card Telegram accepted (delivery dedupe).
     sent_hits: set[str] = field(default_factory=set)
 
     @property
@@ -200,18 +210,161 @@ def hit_identity(hit: dict[str, Any]) -> str:
     return f"cookie:{cookie_text(hit)[:64]}"
 
 
-def is_premium_hit(hit: dict[str, Any]) -> bool:
-    """Premium unless the checker flags an ads tier.
+# ── plan-name normalisation ─────────────────────────────────────────
+# Netflix names its plans in the viewer's language, so the same tier arrives
+# as "Standard", "Padrão", "Estándar" or "スタンダード". Matching the English
+# words alone leaves every other locale unclassified (the Go API reports
+# `plan_type: unknown` for them). These token tables fold a localised name
+# into a plan family and flag the ad-supported variants.
+PLAN_FAMILY_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "premium",
+        (
+            "premium", "premiun", "premijum", "ultimate", "премиум", "преміум",
+            "премијум", "بريميوم", "پرمیوم", "プレミアム", "프리미엄", "高级",
+            "高級", "פרימיום",
+            # Turkish and Vietnamese keep their own words for Premium, and
+            # Hindi / Thai use native scripts rather than a transliteration.
+            "ozel", "cao cap", "प्रीमियम", "พรีเมียม",
+        ),
+    ),
+    (
+        "standard",
+        (
+            "standard", "standart", "standar", "standardowy", "padrão", "padrao",
+            "estándar", "estandar", "standaard", "стандарт",
+            "スタンダード", "스탠다드", "标准", "標準",
+            # Vietnamese / Hebrew / Arabic / Hindi / Thai localise it too.
+            "tieu chuan", "סטנדרטי", "قياسي", "मानक", "มาตรฐาน",
+        ),
+    ),
+    (
+        "basic",
+        (
+            "basic", "basique", "básico", "basico", "basis", "podstawowy",
+            "базовый", "ベーシック", "기본", "基础", "基礎",
+            # Indonesian, Turkish, Vietnamese, Hebrew, Arabic, Hindi, Thai,
+            # Hungarian, Czech and Finnish each use their own word.
+            "dasar", "temel", "co ban", "בסיסי", "أساسي", "बेसिक",
+            "พื้นฐาน", "alap", "zakladni", "perus",
+        ),
+    ),
+)
 
-    The Go API reports both a display `plan` ("Premium") and a machine
-    `plan_type` ("premium"/"standard_with_ads"), plus `is_ads_tier`, so all
-    three are considered before falling back to a free hit.
+ADS_PLAN_TOKENS: tuple[str, ...] = (
+    "ads", "ad-supported", "anúncio", "anuncio", "anoncio", "publicidad",
+    # "publicit" covers the Italian "pubblicità" and French "publicité".
+    "pubblicit", "publicit", "werbung", "avec pub", "annonce", "met reclame",
+    "reklam", "iklan", "annonser", "annoncer", "oglas", "hirdet",
+    "광고", "広告", "广告", "廣告", "реклам", "إعلان", "إعلانات",
+    "פרסומות", "โฆษณา",
+)
+
+
+def fold_plan_name(plan: str) -> str:
+    """Lower-case a plan name and strip accents.
+
+    Netflix localises the same tier with a diacritic in some markets —
+    Hungarian "Prémium", Portuguese "Padrão" — so matching on the raw text
+    treats those as unknown. Folding makes "Prémium" match "premium" and
+    "cao cấp" match "cao cap".
+    """
+    text = unicodedata.normalize("NFKD", str(plan or "").strip().lower())
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def plan_family(plan: str) -> str:
+    """Map a localised plan name to "premium" / "standard" / "basic".
+
+    Unknown or empty names return "", so callers can fall back to the API's
+    machine-readable fields.
+    """
+    text = fold_plan_name(plan)
+    if not text:
+        return ""
+    for family, tokens in PLAN_FAMILY_TOKENS:
+        # Tokens are folded the same way so a script that NFKD decomposes
+        # (Devanagari "प्रीमियम") still matches the folded plan name.
+        if any(fold_plan_name(token) in text for token in tokens):
+            return family
+    return ""
+
+
+def is_ads_plan(plan: str) -> bool:
+    """True for the ad-supported tier in any language."""
+    text = fold_plan_name(plan)
+    return any(fold_plan_name(token) in text for token in ADS_PLAN_TOKENS)
+
+
+# Values the Go API writes when a field is missing from the membership page.
+_UNKNOWN_TEXTS: frozenset[str] = frozenset(
+    {"unknown", "n/a", "na", "null", "undefined", "-", "--", "—"}
+)
+
+
+def known_text(raw: Any, fallback: str = "—") -> str:
+    """A field value, or the fallback when the checker could not read it.
+
+    The API spells every missing value "Unknown" whatever the locale, so the
+    card would otherwise show that word instead of a neutral dash.
+    """
+    text = str(raw if raw is not None else "").strip()
+    if not text or text.lower() in _UNKNOWN_TEXTS:
+        return fallback
+    return text
+
+
+def plan_display(account: dict[str, Any], fallback: str = "—") -> str:
+    """Plan label for the card, in any language or currency.
+
+    The localised display name wins; when the page exposes none, the English
+    ``plan_code`` / ``plan_type`` the checker also extracts is used, so a
+    market whose plan wording is unfamiliar still shows a real tier.
+    """
+    for key in ("plan", "plan_code", "plan_type"):
+        text = known_text(account.get(key), "")
+        if text:
+            return text
+    return fallback
+
+
+def price_label(account: dict[str, Any], fallback: str = "—") -> str:
+    """Price with its currency, whatever the market's currency is.
+
+    Netflix renders the amount with a local symbol ("₺149,99") in most
+    locales and with a bare number plus a currency code in others, so the
+    code is appended only when the amount does not already carry it.
+    """
+    price = known_text(account.get("price"), "")
+    currency = known_text(account.get("currency"), "")
+    if price and currency and currency.upper() not in price.upper():
+        return f"{price} {currency}"
+    return price or currency or fallback
+
+
+def is_premium_hit(hit: dict[str, Any]) -> bool:
+    """True only for a live Premium plan.
+
+    A cookie that still opens the membership page for a closed account
+    reports no plan at all, and basic / standard / ads tiers are valid but
+    not premium. The Go API reports a display `plan` ("Premium"), a machine
+    `plan_type` ("premium"/"standard_with_ads"), `is_ads_tier` and
+    `membership_status`, so all of them are checked. The display name is
+    normalised first, so "Premium" in any locale still counts.
     """
     account = hit.get("account") or {}
+    status = str(account.get("membership_status") or "").strip().upper()
+    if status in ("FORMER_MEMBER", "NEVER_MEMBER"):
+        return False
     if account.get("is_premium") is True:
         return True
-    if truthy(account.get("is_ads_tier")):
-        return False
-    plan = str(account.get("plan") or "").strip().lower()
+    plan = str(account.get("plan") or "")
+    # The machine-readable plan code is locale independent, so it still names
+    # the tier when the localised display name uses unfamiliar wording.
+    plan_code = str(account.get("plan_code") or "")
     plan_type = str(account.get("plan_type") or "").strip().lower()
-    return "premium" in plan or "ultimate" in plan or plan_type == "premium"
+    if truthy(account.get("is_ads_tier")) or is_ads_plan(plan) or is_ads_plan(plan_code):
+        return False
+    if plan_family(plan) == "premium" or plan_family(plan_code) == "premium":
+        return True
+    return plan_type in ("premium", "ultimate")

@@ -190,10 +190,7 @@ def admin_dashboard_keyboard() -> InlineKeyboardMarkup:
                 button(f"◆ {sc('Keys')}", callback_data=CB.ADMIN_KEYS, style="primary"),
                 button(f"◇ {sc('Channels')}", callback_data=CB.ADMIN_CHANNELS, style="success"),
             ],
-            [
-                button(f"◆ {sc('Broadcast')}", callback_data=CB.ADMIN_BROADCAST, style="primary"),
-                button(f"◇ {sc('Videos')}", callback_data=CB.ADMIN_VIDEOS, style="success"),
-            ],
+            [button(f"◆ {sc('Broadcast')}", callback_data=CB.ADMIN_BROADCAST, style="primary")],
             [
                 button(f"◆ {sc('Logs')}", callback_data=CB.ADMIN_LOGS, style="primary"),
                 button(f"◇ {sc('Config')}", callback_data=CB.ADMIN_CONFIG, style="success"),
@@ -474,8 +471,9 @@ def admin_config_keyboard(config: dict[str, Any]) -> InlineKeyboardMarkup:
                     callback_data=f"{CB.ADMIN_CONFIG_SET}max_concurrent",
                     style="primary",
                 ),
-                button(f"◇ {sc('Admin Home')}", callback_data=CB.ADMIN_HOME, style="success"),
+                button(f"◇ {sc('Videos')}", callback_data=CB.ADMIN_VIDEOS, style="success"),
             ],
+            [button(f"◇ {sc('Admin Home')}", callback_data=CB.ADMIN_HOME, style="success")],
         ]
     )
 

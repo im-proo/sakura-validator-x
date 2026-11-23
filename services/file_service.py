@@ -24,7 +24,14 @@ from typing import Any
 import aiofiles
 
 import config
-from models.schemas import cookie_text, remaining_label, truthy
+from models.schemas import (
+    cookie_text,
+    known_text,
+    plan_display,
+    price_label,
+    remaining_label,
+    truthy,
+)
 from ui.typography import BOT_NAME_DISPLAY, BRAND_FOOTER
 
 logger = logging.getLogger(__name__)
@@ -66,7 +73,9 @@ def safe_temp_path(file_name: str) -> str:
     return os.path.join(temp_dir(), f"sakura_{uuid.uuid4().hex[:12]}_{stem}")
 
 
-NETFLIX_ID_RE = re.compile(rb"(?<!Secure)NetflixId", re.IGNORECASE)
+# A cookie *name* is exactly NetflixId: SecureNetflixId and __Host-netflixId
+# are different cookies and must not inflate the set count.
+NETFLIX_ID_RE = re.compile(rb"(?<![A-Za-z0-9_-])NetflixId(?![A-Za-z0-9_])", re.IGNORECASE)
 NETFLIX_WORD_RE = re.compile(rb"netflix", re.IGNORECASE)
 NETFLIX_MARKER_BYTES = NETFLIX_MARKER.encode()
 
@@ -198,6 +207,7 @@ def estimate_cookie_count(path: str, ext: str) -> int:
     if kind == "zip":
         try:
             with zipfile.ZipFile(path) as archive:
+                total_ids = 0
                 total_marker = 0
                 scanned = 0
                 for info in archive.infolist():
@@ -210,7 +220,13 @@ def estimate_cookie_count(path: str, ext: str) -> int:
                     with archive.open(info) as member:
                         chunk = member.read()
                     scanned += len(chunk)
+                    total_ids += _count_in_text(chunk)
                     total_marker += chunk.count(NETFLIX_MARKER_BYTES)
+                # One NetflixId cookie per session, so this is the real count
+                # (a Netscape export has ~6 domain lines per set, which used
+                # to make a 2,600-cookie zip look like 4,500).
+                if total_ids:
+                    return total_ids
                 if total_marker:
                     return max(1, total_marker // COOKIE_LINES_PER_SET)
         except (zipfile.BadZipFile, OSError):
@@ -285,7 +301,10 @@ async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dic
             "again (.txt, or a .zip of .txt files) and send it"
         )
     if found:
-        estimated = max(estimated, found)
+        # Counted NetflixId cookies are authoritative: the size-based guess
+        # overcounts Netscape exports, which used to reject valid uploads on
+        # the free plan.
+        estimated = found
 
     if estimated > plan_max:
         _silent_remove(local_path)
@@ -305,10 +324,11 @@ async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dic
 
 
 def _value(account: dict[str, Any], key: str, fallback: str) -> str:
-    value = account.get(key)
-    if value is None or str(value).strip() == "" or str(value).strip().lower() == "none":
+    """A field value, or the fallback when it is empty or unextracted."""
+    text = known_text(account.get(key), fallback)
+    if text.strip().lower() == "none":
         return fallback
-    return str(value).strip()
+    return text
 
 
 def build_hit_text(hit: dict[str, Any]) -> str:
@@ -326,7 +346,7 @@ def build_hit_text(hit: dict[str, Any]) -> str:
         f"Name: {_value(account, 'name', '—')}",
         f"Email: {_value(account, 'email', '—')}",
         f"Country: {_value(account, 'country', '—')} {account.get('country_flag', '')}".rstrip(),
-        f"Plan: {_value(account, 'plan', '—')}",
+        f"Plan: {plan_display(account)}",
         f"Member Since: {_value(account, 'member_since', '—')}",
         f"Next Billing: {_value(account, 'next_billing', '—')}",
         f"Payment: {_value(account, 'payment', '—')}",
@@ -334,7 +354,8 @@ def build_hit_text(hit: dict[str, Any]) -> str:
         f"Phone: {_value(account, 'phone', '—')}",
         f"Quality: {_value(account, 'video_quality', _value(account, 'quality', '—'))}",
         f"Streams: {_value(account, 'streams', '—')}",
-        f"Price: {_value(account, 'price', '—')}",
+        f"Price: {price_label(account)}",
+        f"Currency: {_value(account, 'currency', '—')}",
         f"Hold Status: {'Yes' if hold else 'No'}",
         f"Extra Member: {'Yes' if extra else 'No'}",
         f"Email Verified: {'Yes' if verified else 'No'}",

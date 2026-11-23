@@ -33,6 +33,21 @@ HIT = {
 }
 
 
+FREE_HIT = {
+    "status": "hit",
+    "account": {
+        "name": "Padrao",
+        "email": "free@example.com",
+        "country": "BR",
+        "plan": "Padrão com anúncios",
+        "plan_type": "standard_with_ads",
+        "is_ads_tier": True,
+        "user_guid": "FREE1",
+    },
+    "cookie": "NetflixId=free",
+}
+
+
 class FakeMessage:
     message_id = 99
 
@@ -180,6 +195,36 @@ def test_hits_are_delivered_only_once(tmp_path):
     assert len(bot.rich) == 2
 
 
+def test_all_mode_never_delivers_non_premium_hits(tmp_path):
+    """All mode may fetch every valid session but only premium is a hit."""
+    bot = FakeBot()
+    session = make_session(tmp_path, hit_mode="all")
+    calls = run(
+        session,
+        bot,
+        status_side_effect=[
+            {"status": "running", "checked": 2, "total": 3, "hits": 2, "cpm": 10.0},
+            {"status": "done", "checked": 3, "total": 3, "hits": 2, "cpm": 10.0},
+        ],
+        hits=[HIT, FREE_HIT],
+    )
+
+    # one hit card (premium only) + completion card
+    assert len(bot.rich) == 2
+    assert session.stats.premium == 1
+    assert session.stats.hits == 1
+    assert session.stats.api_hits == 2
+    assert session.stats.free == 1
+    delivered = [h["account"]["email"] for h in session.delivered]
+    assert delivered == ["user@example.com"]
+
+    # only the premium accounts are recorded / bundled
+    assert calls["record"].await_args.kwargs["hits"] == 1
+    assert calls["record"].await_args.kwargs["premium_hits"] == 1
+    files = [getattr(d.get("document"), "filename", "") for d in bot.documents]
+    assert any(name.endswith(".zip") for name in files)
+
+
 def test_cancelled_run_still_releases_and_reports(tmp_path):
     bot = FakeBot()
     session = make_session(tmp_path, hit_mode="all")
@@ -244,13 +289,15 @@ def test_status_fields_map_from_go_snapshot():
         },
     )
     assert session.stats.checked == 4
-    assert session.stats.hits == 1
+    # `hits` is premium-only; the raw valid count is kept as api_hits.
+    assert session.stats.api_hits == 1
+    assert session.stats.hits == 0
     assert session.stats.bad == 3
     assert session.stats.cpm == 812.5
 
 
-def test_free_row_is_hits_minus_premium():
-    """valid = premium + free must always hold on the dashboard."""
+def test_free_row_is_valid_minus_premium():
+    """hits = premium and free = valid - premium must always hold."""
     from types import SimpleNamespace
 
     from models.schemas import SessionStats
@@ -258,6 +305,7 @@ def test_free_row_is_hits_minus_premium():
     session = SimpleNamespace(stats=SessionStats())
     session.stats.premium = 2
     cs._apply_status(session, {"status": "running", "total": 10, "checked": 9, "hits": 5, "expired": 4})
-    assert session.stats.hits == 5
+    assert session.stats.api_hits == 5
+    assert session.stats.hits == 2
     assert session.stats.premium == 2
     assert session.stats.free == 3

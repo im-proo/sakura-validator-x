@@ -43,6 +43,10 @@ MAX_PAGES_PER_SWEEP = 20
 HITS_PAGE_SIZE = 100
 TRANSIENT_RETRIES = 5
 
+# Plan names already reported as "not premium" in this process, so a batch of
+# free accounts logs each distinct plan once instead of once per cookie.
+_logged_plans: set[tuple[str, str]] = set()
+
 
 @dataclass
 class CheckSession:
@@ -147,8 +151,6 @@ async def _send_hit(bot: Bot, session: CheckSession, hit: dict[str, Any]) -> boo
         return False
 
     session.delivered.append(hit)
-    if is_premium_hit(hit):
-        session.stats.premium += 1
     if truthy(account.get("is_on_hold")) or truthy(account.get("hold_status")):
         session.stats.hold += 1
 
@@ -181,7 +183,12 @@ async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
                 session.job_id,
                 page=page,
                 page_size=HITS_PAGE_SIZE,
-                plan_filter="premium" if session.premium_only else "",
+                # Never let the API pre-filter by plan: its filter is a raw
+                # substring match on the display name, so a localised Premium
+                # name it does not know is dropped server-side and the bot can
+                # only count it as `free`. Pulling every valid session lets
+                # the classifier below decide, and log the names it rejects.
+                plan_filter="",
             )
         except checker_api.CheckerAPIError as exc:
             logger.warning("hit fetch failed session=%s page=%s: %s", session.session_id, page, exc)
@@ -194,7 +201,39 @@ async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
         for hit in hits:
             if str(hit.get("status") or "hit") != "hit":
                 continue
+            # Count each valid session once, the moment it is fetched: the
+            # live card then shows a Premium account as a hit even before its
+            # Telegram message has been sent. Delivery is deduped separately.
             identity = hit_identity(hit)
+            premium = is_premium_hit(hit)
+            if identity not in session.stats.seen_hits:
+                session.stats.seen_hits.add(identity)
+                if premium:
+                    session.stats.premium += 1
+            # Both modes deliver hits as premium accounts only. All mode
+            # simply asks the API for every valid session, so basic /
+            # standard / ads accounts are counted (as free) but never sent.
+            if not premium:
+                # Record what the API reported, so an unrecognised localised
+                # plan name is visible instead of silently disappearing into
+                # `free`. Logged once per plan name, not once per cookie.
+                account = hit.get("account") or {}
+                marker = (
+                    str(account.get("plan") or ""),
+                    str(account.get("plan_code") or ""),
+                    str(account.get("plan_type") or ""),
+                )
+                if marker not in _logged_plans:
+                    _logged_plans.add(marker)
+                    logger.info(
+                        "not a premium hit: plan=%r plan_code=%r plan_type=%r ads=%r membership=%r",
+                        account.get("plan"),
+                        account.get("plan_code"),
+                        account.get("plan_type"),
+                        account.get("is_ads_tier"),
+                        account.get("membership_status"),
+                    )
+                continue
             if identity in session.stats.sent_hits:
                 continue
             # Only mark delivered once Telegram accepted the card, so a failed
@@ -272,8 +311,12 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
                 continue
 
             _apply_status(session, status)
-            await _edit_live_card(bot, session)
+            # Fetch before drawing: a hit delivered on this sweep must already
+            # be counted, otherwise the card shows it as free until the next
+            # poll (three seconds later) repaints with the same numbers.
             await _fetch_new_hits(bot, session)
+            _split_counts(session)
+            await _edit_live_card(bot, session)
 
             state = str(status.get("status") or "running").lower()
             if state in ("done", "cancelled", "failed"):
@@ -310,7 +353,7 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
 def _apply_status(session: CheckSession, status: dict[str, Any]) -> None:
     """Fold one poll payload into the session counters."""
     session.stats.checked = int(status.get("checked") or 0)
-    session.stats.hits = int(status.get("hits") or 0)
+    session.stats.api_hits = int(status.get("hits") or 0)
     # The Go API counts non-hits as "expired" and exposes RPM as "current_rpm".
     session.stats.bad = int(status.get("expired") or status.get("bad") or 0)
     session.stats.errors = int(status.get("errors") or 0)
@@ -320,9 +363,14 @@ def _apply_status(session: CheckSession, status: dict[str, Any]) -> None:
     if total:
         session.stats.total = total
         session.total = total
-    # Free = everything the API counted as a hit that is not premium, so the
-    # valid / premium / free rows always add up.
-    session.stats.free = max(0, session.stats.hits - session.stats.premium)
+    _split_counts(session)
+
+
+def _split_counts(session: CheckSession) -> None:
+    """Premium accounts are hits; every other valid session is free."""
+    premium = min(session.stats.premium, session.stats.api_hits)
+    session.stats.hits = premium
+    session.stats.free = max(0, session.stats.api_hits - premium)
 
 
 async def _finalize(bot: Bot, session: CheckSession) -> None:
@@ -334,7 +382,7 @@ async def _finalize(bot: Bot, session: CheckSession) -> None:
     await plan_service.record_check_result(
         session.user_id,
         checks=session.stats.checked,
-        hits=len(session.delivered),
+        hits=len(premium_hits),
         premium_hits=len(premium_hits),
     )
 
