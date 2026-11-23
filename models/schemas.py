@@ -356,6 +356,10 @@ def is_premium_hit(hit: dict[str, Any]) -> bool:
     status = str(account.get("membership_status") or "").strip().upper()
     if status in ("FORMER_MEMBER", "NEVER_MEMBER"):
         return False
+    # A paused subscription still shows its plan, so a held account reads as
+    # Premium while nothing plays on it. It is never a deliverable hit.
+    if truthy(account.get("is_on_hold")) or truthy(account.get("hold_status")):
+        return False
     if account.get("is_premium") is True:
         return True
     plan = str(account.get("plan") or "")
