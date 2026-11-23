@@ -7,12 +7,14 @@ channels.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Any, Awaitable, Callable
 
 import config
 import core.database as database
+from models.schemas import utcnow
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery
 from ui import keyboards, renderer
@@ -155,15 +157,69 @@ class ForceJoinMiddleware(BaseMiddleware):
         if not channels:
             return await handler(event, data)
 
+        fingerprint = channel_fingerprint(channels)
+
+        # Verified once for exactly this channel set: never probe again until
+        # an admin adds (or removes) a channel, which changes the fingerprint.
+        if await is_verified(user.id, fingerprint):
+            return await handler(event, data)
+
         unjoined = await unjoined_channels(data["bot"], user.id, channels)
         if not unjoined:
+            await mark_verified(user.id, fingerprint)
             return await handler(event, data)
 
         if isinstance(event, CallbackQuery):
             await event.answer()
-        card, keyboard = await build_verify_screen(data["bot"], unjoined)
+        # Every channel is rendered, not just the probeable ones, so a single
+        # unreachable channel can never shrink the keyboard to one button.
+        card, keyboard = await build_verify_screen(data["bot"], channels)
         await _deliver(data["bot"], event, card, keyboard)
         return None
+
+
+def channel_fingerprint(channels: list[dict[str, Any]]) -> str:
+    """Stable id of the current channel set (order-independent)."""
+    ids = sorted(str(c.get("channel_id") or "").strip() for c in channels if c.get("channel_id"))
+    return hashlib.sha1("|".join(ids).encode("utf-8")).hexdigest()[:16] if ids else ""
+
+
+_verified_cache: dict[int, tuple[str, float]] = {}
+_VERIFIED_TTL = 300.0
+
+
+async def is_verified(user_id: int, fingerprint: str) -> bool:
+    """True when this user already passed the gate for this channel set."""
+    if not fingerprint:
+        return True
+    now = time.monotonic()
+    cached = _verified_cache.get(user_id)
+    if cached and cached[0] == fingerprint and now - cached[1] < _VERIFIED_TTL:
+        return True
+    try:
+        doc = await database.users().find_one(
+            {"user_id": int(user_id)}, {"verified_channels": 1}
+        )
+    except Exception as exc:
+        logger.debug("verified flag read failed user=%s: %s", user_id, exc)
+        return False
+    stored = str((doc or {}).get("verified_channels") or "")
+    if stored and stored == fingerprint:
+        _verified_cache[user_id] = (fingerprint, now)
+        return True
+    return False
+
+
+async def mark_verified(user_id: int, fingerprint: str) -> None:
+    """Remember that the user passed the gate for this exact channel set."""
+    _verified_cache[user_id] = (fingerprint, time.monotonic())
+    try:
+        await database.users().update_one(
+            {"user_id": int(user_id)},
+            {"$set": {"verified_channels": fingerprint, "verified_at": utcnow()}},
+        )
+    except Exception as exc:
+        logger.warning("verified flag write failed user=%s: %s", user_id, exc)
 
 
 async def active_channels() -> list[dict[str, Any]]:
@@ -180,8 +236,15 @@ async def active_channels() -> list[dict[str, Any]]:
     except Exception as exc:
         logger.warning("channel list read failed: %s", exc)
 
-    channels = [doc for doc in docs if doc.get("is_active")]
+    channels = [dict(doc) for doc in docs if doc.get("is_active")]
     known = {str(doc.get("channel_id") or "").strip() for doc in docs}
+
+    for channel in channels:
+        if not str(channel.get("channel_link") or "").strip():
+            channel_id = str(channel.get("channel_id") or "").strip()
+            fallback = str(config.FORCE_JOIN_LINKS.get(channel_id, "") or "").strip()
+            if fallback:
+                channel["channel_link"] = fallback
 
     for index, chat_id in enumerate(config.FORCE_JOIN_CHANNELS, start=len(channels) + 1):
         chat_id = str(chat_id).strip()
@@ -191,7 +254,7 @@ async def active_channels() -> list[dict[str, Any]]:
             {
                 "channel_id": chat_id,
                 "channel_name": chat_id,
-                "channel_link": "",
+                "channel_link": str(config.FORCE_JOIN_LINKS.get(chat_id, "") or ""),
                 "is_active": True,
                 "order": index,
             }
@@ -236,6 +299,8 @@ async def resolve_channel_links(
         chat_id = str(item.get("channel_id") or "").strip()
         link = str(item.get("channel_link") or "").strip()
         if not link and chat_id:
+            link = str(config.FORCE_JOIN_LINKS.get(chat_id, "") or "").strip()
+        if not link and chat_id:
             cached = _link_cache.get(chat_id)
             if cached and now - cached[1] < _LINK_TTL:
                 link = cached[0]
@@ -277,5 +342,9 @@ async def unjoined_channels(
         except Exception as exc:
             # Treated as joined so a Telegram hiccup cannot lock everyone out,
             # but logged loudly: it usually means the bot is not an admin there.
-            logger.warning("membership probe failed channel=%s: %s", chat_id, exc)
+            logger.warning(
+                "membership probe failed channel=%s (bot must be an admin there): %s",
+                chat_id,
+                exc,
+            )
     return missing

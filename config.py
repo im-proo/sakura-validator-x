@@ -43,6 +43,16 @@ FORCE_JOIN_CHANNELS = (
     "-1003965937636",
 )
 
+# Join links for the channels above, used when Telegram will not hand one over
+# (private channel, or the bot is not an admin there). Add an invite link per
+# id; the bot also tries @username → chat invite link → fresh invite link.
+FORCE_JOIN_LINKS = {
+    "-1003791098639": "",
+    "-1003715365551": "",
+    "-1004445390575": "https://t.me/nyroxbots",
+    "-1003965937636": "",
+}
+
 # Database used when MONGO_URI does not name one in its path.
 MONGO_DB_DEFAULT = "sakura_validator_x"
 
