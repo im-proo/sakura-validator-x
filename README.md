@@ -29,6 +29,8 @@ upload when the job ends.
   health monitor, capacity reservation and automatic failover.
 - **Admin panel** — users, plans, keys, API instances, channels, videos,
   broadcast, runtime config and logs.
+- **Health endpoint** — binds `0.0.0.0:$PORT` with `GET /health` so hosting
+  platforms and uptime monitors see a live service.
 - **Hardcoded configuration** — two environment variables, everything else in
   `config.py`. JSON logs by default.
 
@@ -70,10 +72,42 @@ it, restart the bot, done. No other environment variables are read.
 ```bash
 docker build -t sakura-validator-x .
 docker run -d --name sakura \
+  -p 8080:8080 \
   -e BOT_TOKEN=... \
   -e MONGO_URI=mongodb://host.docker.internal:27017/sakura_validator_x \
   sakura-validator-x
 ```
+
+## Keeping it online 24/7
+
+The bot binds a small HTTP server on `0.0.0.0:$PORT` (`PORT` defaults to
+`8080`) when it starts, and closes it on shutdown. That port is what hosting
+platforms probe; long polling alone opens no port, which is why a platform
+logs *"no open ports detected"* and stops the service.
+
+| What | Value |
+| --- | --- |
+| Health URL (local) | `http://127.0.0.1:8080/health` |
+| Health URL (deployed) | `https://<your-app-host>/health` |
+| Alternative | `https://<your-app-host>/` (same JSON) |
+| Expected response | `200` with `{"status": "ok", ...}` |
+
+With UptimeRobot: **Add New Monitor → HTTP(s)** → URL
+`https://<your-app-host>/health` → interval **5 minutes** → keyword
+`"status": "ok"` (optional, catches a port that answers but a bot that is
+half-dead is not covered — Telegram polling is not part of the probe).
+
+Checklist for a real 24/7 deployment:
+
+- Enable **public networking** on the platform and make sure it routes to the
+  same `PORT` the process was given (do not hardcode a different one).
+- Use a hosted MongoDB (`MONGO_URI=mongodb+srv://…`); `127.0.0.1` only exists
+  inside the container and will be lost on restart.
+- Keep the checker API reachable from the host, or the bot starts fine but
+  every check fails with `no checker instance available`.
+- One instance only: Telegram long polling allows a single `getUpdates`
+  consumer, so two replicas will fight over updates.
+
 
 ## Configuration (`config.py`)
 

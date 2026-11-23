@@ -4,7 +4,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    TEMP_DIR=/tmp/sakura
+    TEMP_DIR=/tmp/sakura \
+    PORT=8080
 
 WORKDIR /app
 
@@ -20,6 +21,9 @@ RUN useradd --create-home --uid 10001 sakura \
     && chown -R sakura:sakura /app "$TEMP_DIR"
 
 USER sakura
+
+# Health endpoint for the platform / uptime monitors (GET /health).
+EXPOSE 8080
 
 # Configuration comes from the environment — never bake .env into the image.
 # Required: BOT_TOKEN, MONGO_URI. Everything else is hardcoded in config.py.

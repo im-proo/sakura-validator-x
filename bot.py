@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 import config
+import webserver
 import core.api_manager as api_manager
 import core.checker_api as checker_api
 import core.database as database
@@ -127,6 +128,8 @@ def build_dispatcher() -> Dispatcher:
 
 
 async def on_startup(bot: Bot) -> None:
+    # Hosting platforms need a listening port for their health checks.
+    await webserver.start()
     await database.connect()
     await database.create_indexes()
 
@@ -156,6 +159,7 @@ async def on_startup(bot: Bot) -> None:
 
 async def on_shutdown(bot: Bot) -> None:
     logger.info("shutting down")
+    await webserver.stop()
     scheduler_shutdown()
     await api_manager.stop_health_monitor()
     await checker_api.close_session()
