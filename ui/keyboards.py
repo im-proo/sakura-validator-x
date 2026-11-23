@@ -18,7 +18,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from ui.states import CB
 from ui.typography import sc
 
-MAX_CHANNEL_BUTTONS = 5
+MAX_CHANNEL_BUTTONS = 8
 
 
 def button(
@@ -45,22 +45,35 @@ def markup(rows: Iterable[Sequence[InlineKeyboardButton]]) -> InlineKeyboardMark
 
 # ── user side ────────────────────────────────────────────────────────
 def verify_keyboard(channels: Sequence[dict[str, Any]]) -> InlineKeyboardMarkup:
-    """Join buttons plus the verify action (max 5 channels + 1 verify)."""
+    """Every channel as a join button, two per row, verify on its own row.
+
+    Four channels therefore render as: [A][B] / [C][D] / [Verify].
+    """
     rows: list[list[InlineKeyboardButton]] = []
-    joins = [c for c in channels if str(c.get("channel_link") or "").strip()][:MAX_CHANNEL_BUTTONS]
+    joins = list(channels)[:MAX_CHANNEL_BUTTONS]
 
     for index in range(0, len(joins), 2):
         pair = joins[index : index + 2]
-        rows.append(
-            [
-                button(
-                    f"{'◆' if i == 0 else '◇'} {sc(str(c.get('channel_name') or 'channel'))}",
-                    url=str(c.get("channel_link")),
-                    style="primary",
+        row_buttons: list[InlineKeyboardButton] = []
+        for i, c in enumerate(pair):
+            chat_id = str(c.get("channel_id") or "")
+            name = sc(str(c.get("channel_name") or chat_id or "channel"))[:16]
+            link = str(c.get("channel_link") or "").strip()
+            if link:
+                row_buttons.append(
+                    button(f"{'◆' if i == 0 else '◇'} {name}", url=link, style="primary")
                 )
-                for i, c in enumerate(pair)
-            ]
-        )
+            else:
+                # No resolvable link: keep the slot so the user sees which
+                # channel is missing instead of silently losing it.
+                row_buttons.append(
+                    button(
+                        f"{'◆' if i == 0 else '◇'} {name}",
+                        callback_data=CB.VERIFY,
+                        style="danger",
+                    )
+                )
+        rows.append(row_buttons)
 
     rows.append([button(f"◆ {sc('Verify')}", callback_data=CB.VERIFY, style="success")])
     return markup(rows)

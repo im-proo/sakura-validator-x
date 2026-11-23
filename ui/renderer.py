@@ -430,7 +430,8 @@ def render_verify_card(channels: Sequence[dict[str, Any]], video: str = "") -> I
     rows = [para(f"→ {sc('Join all channels to continue')} {S_STAR}")]
     for channel in channels:
         name = str(channel.get("channel_name") or channel.get("channel_id") or "channel")
-        rows.append(para(f"{S_BULLET} {esc(name)}"))
+        link = str(channel.get("channel_link") or "").strip()
+        rows.append(para(f"{S_BULLET} {esc(name)} — {esc(link)}" if link else f"{S_BULLET} {esc(name)}"))
     card.quote(*rows)
     card.quote(
         para(f"→ {sc('join all channels to unlock sakura')} {S_STAR}"),

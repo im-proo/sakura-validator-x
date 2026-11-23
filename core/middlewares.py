@@ -161,22 +161,103 @@ class ForceJoinMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery):
             await event.answer()
-        await _deliver(
-            data["bot"],
-            event,
-            renderer.render_verify_card(unjoined),
-            keyboards.verify_keyboard(unjoined),
-        )
+        card, keyboard = await build_verify_screen(data["bot"], unjoined)
+        await _deliver(data["bot"], event, card, keyboard)
         return None
 
+
 async def active_channels() -> list[dict[str, Any]]:
-    """Every channel the bot gates on, in display order."""
+    """Every channel the bot gates on, in display order.
+
+    The Mongo collection is the catalogue, but channels listed in
+    ``config.FORCE_JOIN_CHANNELS`` are always gated too — that way a fresh
+    database, or one where only some rows were added, still enforces the
+    full set. Rows an admin disabled are left out.
+    """
+    docs: list[dict[str, Any]] = []
     try:
-        cursor = database.channels().find({"is_active": True}).sort("order", 1)
-        return [doc async for doc in cursor]
+        docs = [doc async for doc in database.channels().find({}).sort("order", 1)]
     except Exception as exc:
         logger.warning("channel list read failed: %s", exc)
-        return []
+
+    channels = [doc for doc in docs if doc.get("is_active")]
+    known = {str(doc.get("channel_id") or "").strip() for doc in docs}
+
+    for index, chat_id in enumerate(config.FORCE_JOIN_CHANNELS, start=len(channels) + 1):
+        chat_id = str(chat_id).strip()
+        if not chat_id or chat_id in known:
+            continue
+        channels.append(
+            {
+                "channel_id": chat_id,
+                "channel_name": chat_id,
+                "channel_link": "",
+                "is_active": True,
+                "order": index,
+            }
+        )
+    return channels
+
+
+_link_cache: dict[str, tuple[str, float]] = {}
+_LINK_TTL = 600.0
+
+
+async def _lookup_channel_link(bot: Any, chat_id: str) -> str:
+    """Public link, stored invite link, or a freshly minted invite link."""
+    try:
+        chat = await bot.get_chat(chat_id)
+    except Exception as exc:
+        logger.warning("channel link lookup failed channel=%s: %s", chat_id, exc)
+        return ""
+
+    username = str(getattr(chat, "username", "") or "").strip()
+    if username:
+        return f"https://t.me/{username}"
+    link = str(getattr(chat, "invite_link", "") or "").strip()
+    if link:
+        return link
+    try:
+        invite = await bot.create_chat_invite_link(chat_id)
+        return str(getattr(invite, "invite_link", "") or "")
+    except Exception as exc:
+        logger.warning("invite link creation failed channel=%s: %s", chat_id, exc)
+        return ""
+
+
+async def resolve_channel_links(
+    bot: Any, channels: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Give every channel a join link, so none is dropped from the keyboard."""
+    resolved: list[dict[str, Any]] = []
+    now = time.monotonic()
+    for channel in channels:
+        item = dict(channel)
+        chat_id = str(item.get("channel_id") or "").strip()
+        link = str(item.get("channel_link") or "").strip()
+        if not link and chat_id:
+            cached = _link_cache.get(chat_id)
+            if cached and now - cached[1] < _LINK_TTL:
+                link = cached[0]
+            if not link:
+                link = await _lookup_channel_link(bot, chat_id)
+                if link:
+                    _link_cache[chat_id] = (link, now)
+        item["channel_link"] = link
+        item["channel_name"] = str(item.get("channel_name") or chat_id or "channel")
+        resolved.append(item)
+    return resolved
+
+
+async def build_verify_screen(bot: Any, channels: list[dict[str, Any]]) -> tuple[Any, Any]:
+    """Verification card (with its video) plus the join/verify keyboard."""
+    try:
+        video = str(await database.get_config("verify_video", "") or "")
+    except Exception as exc:
+        logger.warning("verify video read failed: %s", exc)
+        video = ""
+    linked = await resolve_channel_links(bot, channels)
+    return renderer.render_verify_card(linked, video), keyboards.verify_keyboard(linked)
 
 
 async def unjoined_channels(
@@ -194,5 +275,7 @@ async def unjoined_channels(
             if status not in JOINED_STATUSES:
                 missing.append(channel)
         except Exception as exc:
-            logger.debug("membership probe failed channel=%s: %s", chat_id, exc)
+            # Treated as joined so a Telegram hiccup cannot lock everyone out,
+            # but logged loudly: it usually means the bot is not an admin there.
+            logger.warning("membership probe failed channel=%s: %s", chat_id, exc)
     return missing

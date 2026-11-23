@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 import core.database as database
-from core.middlewares import active_channels, unjoined_channels
+from core.middlewares import active_channels, build_verify_screen, unjoined_channels
 from handlers.common import edit_card, send_card, toast
 from services import plan_service
 from ui import keyboards, renderer
@@ -65,12 +65,8 @@ async def handle_verify(call: CallbackQuery, state: FSMContext) -> None:
     missing = await unjoined_channels(call.bot, call.from_user.id, channels)
 
     if missing:
-        video = str(await database.get_config("verify_video", "") or "")
-        await call.bot.send_rich_message(
-            chat_id=call.message.chat.id,
-            rich_message=renderer.render_verify_card(missing, video),
-            reply_markup=keyboards.verify_keyboard(missing),
-        )
+        card, keyboard = await build_verify_screen(call.bot, missing)
+        await edit_card(call, card, keyboard)
         await toast(call, f"◇ {sc('channels still missing')} ✦")
         return
 

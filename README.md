@@ -115,6 +115,7 @@ Checklist for a real 24/7 deployment:
 | --- | --- | --- |
 | `OWNER_ID` | `8900061448` | Owner: bypasses force-join, sees the admin panel |
 | `ADMIN_IDS` | `(8900061448,)` | Extra admins with the same powers |
+| `FORCE_JOIN_CHANNELS` | four `-100…` ids | Channels always gated, even when MongoDB has no row for them |
 | `MONGO_DB_DEFAULT` | `sakura_validator_x` | Database when the URI has no path |
 | `MAX_CONCURRENT_GLOBAL` | `50` | Check sessions allowed at once, all users together |
 | `CHECKER_CONCURRENCY` | `300` | Workers requested per job (`0` = use the API default) |
