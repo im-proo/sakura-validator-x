@@ -254,6 +254,134 @@ def estimate_cookie_count(path: str, ext: str) -> int:
     return max(1, occurrences // COOKIE_LINES_PER_SET)
 
 
+# A line that carries the NetflixId cookie name. SecureNetflixId must not
+# start a new slice, and neither must a longer cookie name.
+NETFLIX_ID_LINE_RE = re.compile(rb"(?<![A-Za-z0-9_-])NetflixId(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _shard_payload(path: str, kind: str) -> bytes | None:
+    """Cookie text of an upload that can be cut, or None when it cannot.
+
+    Plain text is returned as-is; a zip is flattened to the concatenation of
+    its text members. RAR / 7z / gzip and JSON are left to the checker: they
+    have no cheap, safe way to be cut into contiguous cookie slices here.
+    """
+    if kind == "zip":
+        parts: list[bytes] = []
+        try:
+            with zipfile.ZipFile(path) as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    if not info.filename.lower().endswith((".txt", ".json", ".csv")):
+                        return None
+                    with archive.open(info) as member:
+                        chunk = member.read()
+                    if not is_text_bytes(chunk):
+                        return None
+                    if chunk and not chunk.endswith(b"\n"):
+                        chunk += b"\n"
+                    parts.append(chunk)
+        except (zipfile.BadZipFile, OSError, RuntimeError):
+            return None
+        return b"".join(parts) if parts else None
+
+    if kind in OPAQUE_KINDS or kind == "json":
+        return None
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return None
+    return data if is_text_bytes(data) else None
+
+
+def split_cookie_text(data: bytes, chunk_size: int, max_shards: int) -> list[bytes] | None:
+    """Cut cookie text into contiguous slices at NetflixId boundaries.
+
+    Every line lands in exactly one slice, in its original order, so the
+    slices together are the file the user uploaded — nothing is dropped and
+    nothing is checked twice. Returns None when the text cannot be cut
+    safely, and the caller then submits it to a single instance.
+    """
+    if chunk_size < 1 or max_shards < 2:
+        return None
+
+    lines = data.splitlines(keepends=True)
+    if not lines:
+        return None
+
+    blocks: list[list[bytes]] = []
+    current: list[bytes] = []
+    has_id = False
+    for line in lines:
+        starts_set = bool(NETFLIX_ID_LINE_RE.search(line))
+        if starts_set and has_id:
+            blocks.append(current)
+            current = []
+            has_id = False
+        current.append(line)
+        if starts_set:
+            has_id = True
+    if current:
+        blocks.append(current)
+
+    if len(blocks) < 2:
+        return None
+    # A split that does not account for every line would silently check part
+    # of the file, which is exactly what this must never do.
+    if sum(len(block) for block in blocks) != len(lines):
+        return None
+
+    wanted = min(max_shards, -(-len(blocks) // chunk_size))
+    per_shard = -(-len(blocks) // max(1, wanted))
+
+    chunks: list[bytes] = []
+    for start in range(0, len(blocks), per_shard):
+        chunk = b"".join(b"".join(block) for block in blocks[start : start + per_shard])
+        if chunk.strip():
+            chunks.append(chunk)
+    return chunks if len(chunks) > 1 else None
+
+
+async def split_cookie_file(
+    path: str,
+    file_name: str,
+    chunk_size: int,
+    max_shards: int,
+) -> list[dict[str, Any]]:
+    """Write one .txt per slice, ready for a checker instance each.
+
+    Returns [] when the upload has to go to a single instance, so the caller
+    can fall back to the plain single-job path.
+    """
+    if max_shards < 2:
+        return []
+    kind = resolve_kind(path, extension_of(file_name))
+    data = _shard_payload(path, kind)
+    if data is None:
+        return []
+    chunks = split_cookie_text(data, chunk_size, max_shards)
+    if not chunks:
+        return []
+
+    parts: list[dict[str, Any]] = []
+    for index, chunk in enumerate(chunks, start=1):
+        name = f"shard_{index:02d}.txt"
+        target = safe_temp_path(name)
+        try:
+            async with aiofiles.open(target, "wb") as handle:
+                await handle.write(chunk)
+        except OSError as exc:
+            logger.warning("shard write failed: %s", exc)
+            cleanup(*(part["file_path"] for part in parts), target)
+            return []
+        parts.append({"file_path": target, "file_name": name})
+    logger.info("split %s into %s shards", file_name, len(parts))
+    return parts
+
+
 async def handle_user_cookie_file(document: Any, bot: Any, plan_max: int) -> dict[str, Any]:
     """Download a Telegram document and validate it against the plan limit.
 

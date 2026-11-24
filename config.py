@@ -46,6 +46,14 @@ CHECKER_CONCURRENCY = 50
 # Checks per minute per job. 0 = no rate limit.
 CHECKER_RATE_PER_MINUTE = 0
 
+# Cookie sharding: when more than one checker instance is online, the upload
+# is cut into ~1,000-cookie slices and each instance gets its own slice, so a
+# 4,500-cookie file is finished four times faster instead of queueing on one
+# box. Archives that cannot be cut safely are sent to a single instance.
+CHECKER_SHARD_COOKIES = 1000
+# Most instances one file may be spread across.
+CHECKER_MAX_SHARD_APIS = 4
+
 # Instance selection when several checker APIs are online.
 API_ROTATION_MODE = "round_robin"  # round_robin | priority | random
 
@@ -90,6 +98,8 @@ class Settings:
     max_concurrent_global: int
     checker_concurrency: int
     checker_rate_per_minute: int
+    checker_shard_cookies: int
+    checker_max_shard_apis: int
     api_rotation_mode: str
     log_level: str
     log_json: bool
@@ -131,6 +141,8 @@ def load_settings() -> Settings:
         max_concurrent_global=MAX_CONCURRENT_GLOBAL,
         checker_concurrency=CHECKER_CONCURRENCY,
         checker_rate_per_minute=CHECKER_RATE_PER_MINUTE,
+        checker_shard_cookies=max(100, int(CHECKER_SHARD_COOKIES)),
+        checker_max_shard_apis=max(1, int(CHECKER_MAX_SHARD_APIS)),
         api_rotation_mode=rotation,
         log_level=LOG_LEVEL.strip().upper(),
         log_json=LOG_JSON,

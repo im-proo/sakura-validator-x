@@ -16,6 +16,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+import config
 import core.api_manager as api_manager
 import core.database as database
 from handlers.common import edit_card, send_card, toast
@@ -230,8 +231,12 @@ async def _start_check(call: CallbackQuery, state: FSMContext, hit_mode: str) ->
         await toast(call, f"◇ {sc('cluster busy')}")
         return
 
-    api = await api_manager.balancer.select_api()
-    if api is None:
+    # Every online instance gets a slice of the file: 4,500 cookies across
+    # four instances finish about four times faster than on one.
+    apis = await api_manager.balancer.select_apis(
+        config.settings.checker_max_shard_apis
+    )
+    if not apis:
         file_service.cleanup(file_path)
         await state.clear()
         await edit_card(
@@ -247,7 +252,7 @@ async def _start_check(call: CallbackQuery, state: FSMContext, hit_mode: str) ->
 
     session = await checker_service.create_session(
         user=user,
-        api=api,
+        apis=apis,
         hit_mode=hit_mode,
         chat_id=call.message.chat.id,
     )

@@ -283,9 +283,38 @@ class APILoadBalancer:
         _ROUND_ROBIN_INDEX = (_ROUND_ROBIN_INDEX + 1) % 1_000_000
         return picked
 
+    async def select_apis(self, limit: int) -> list[dict[str, Any]]:
+        """Up to `limit` distinct instances, least loaded first.
+
+        One big upload is spread over every returned instance, one slice
+        each, so this never returns the same instance twice.
+        """
+        limit = max(1, int(limit))
+        apis = await list_apis(active_only=True)
+        online = [a for a in apis if a.get("status") in ("online", "slow")]
+        online.sort(
+            key=lambda a: (
+                int(a.get("active_jobs", 0)),
+                int(a.get("priority", 99)),
+                str(a.get("api_id", "")),
+            )
+        )
+        return online[:limit]
+
     async def acquire(self, api_id: str) -> None:
         """Reserve one job slot (atomic increment)."""
         await database.apis().update_one({"api_id": api_id}, {"$inc": {"active_jobs": 1}})
+
+    async def abandon(self, api_id: str) -> None:
+        """Give a reserved slot back without recording a run.
+
+        Used when a slice turned out not to be needed, so an unused instance
+        does not collect a failure in its success counters.
+        """
+        await database.apis().update_one(
+            {"api_id": api_id, "active_jobs": {"$gt": 0}},
+            {"$inc": {"active_jobs": -1}},
+        )
 
     async def release(self, api_id: str, success: bool, final_cpm: float = 0.0) -> None:
         """Return a slot and fold the run into the instance statistics.

@@ -49,8 +49,38 @@ _logged_plans: set[tuple[str, str]] = set()
 
 
 @dataclass
+class Shard:
+    """One checker instance working on one slice of the uploaded file."""
+
+    api_id: str
+    api_url: str
+    job_id: str = ""
+    total: int = 0
+    checked: int = 0
+    hits: int = 0
+    bad: int = 0
+    errors: int = 0
+    hold: int = 0
+    cpm: float = 0.0
+    poll_failures: int = 0
+    # pending | running | done | cancelled | failed
+    state: str = "pending"
+    # False once the reserved slot was handed back without running a job.
+    acquired: bool = True
+
+    @property
+    def active(self) -> bool:
+        return self.state in ("pending", "running")
+
+
+@dataclass
 class CheckSession:
-    """Live state of one running job. Memory only — never persisted."""
+    """Live state of one running job. Memory only — never persisted.
+
+    A session owns one shard per checker instance. With a single instance it
+    is exactly the old one-job flow; with several, each one checks its own
+    slice of the upload and the counters below are their sum.
+    """
 
     session_id: str
     user_id: int
@@ -66,10 +96,21 @@ class CheckSession:
     stats: SessionStats = field(default_factory=SessionStats)
     last_edit_at: float = 0.0
     delivered: list[dict[str, Any]] = field(default_factory=list)
+    shards: list[Shard] = field(default_factory=list)
 
     @property
     def premium_only(self) -> bool:
         return self.hit_mode == "premium_only"
+
+    def shard_list(self) -> list[Shard]:
+        """The slices of this run; a plain session gets its primary one."""
+        if not self.shards:
+            self.shards = [Shard(api_id=self.api_id, api_url=self.api_url)]
+        return self.shards
+
+    def active_shards(self) -> list[Shard]:
+        """Slices that have a job and have not finished yet."""
+        return [s for s in self.shard_list() if s.job_id and s.active]
 
 
 def new_session_id() -> str:
@@ -174,13 +215,24 @@ async def forward_hit(bot: Bot, message_id: int, from_chat_id: int) -> None:
 
 
 async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
-    """Pull every page, deliver hits that have not been delivered yet."""
+    """Pull every page of every slice, deliver hits not delivered yet."""
+    seen = 0
+    for shard in session.shard_list():
+        if not shard.job_id:
+            continue
+        seen += await _fetch_shard_hits(bot, session, shard)
+    if seen:
+        logger.debug("session=%s delivered %s hits", session.session_id, seen)
+
+
+async def _fetch_shard_hits(bot: Bot, session: CheckSession, shard: Shard) -> int:
+    """Deliver the premium hits of one slice. Returns how many were sent."""
     seen = 0
     for page in range(1, MAX_PAGES_PER_SWEEP + 1):
         try:
             payload = await checker_api.get_job_hits(
-                session.api_url,
-                session.job_id,
+                shard.api_url,
+                shard.job_id,
                 page=page,
                 page_size=HITS_PAGE_SIZE,
                 # Never let the API pre-filter by plan: its filter is a raw
@@ -191,12 +243,15 @@ async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
                 plan_filter="",
             )
         except checker_api.CheckerAPIError as exc:
-            logger.warning("hit fetch failed session=%s page=%s: %s", session.session_id, page, exc)
-            return
+            logger.warning(
+                "hit fetch failed session=%s api=%s page=%s: %s",
+                session.session_id, shard.api_id, page, exc,
+            )
+            return seen
 
         hits = payload.get("hits") or []
         if not hits:
-            return
+            return seen
 
         for hit in hits:
             if str(hit.get("status") or "hit") != "hit":
@@ -244,38 +299,112 @@ async def _fetch_new_hits(bot: Bot, session: CheckSession) -> None:
 
         total_pages = int(payload.get("total_pages") or 1)
         if page >= total_pages:
-            return
+            return seen
 
-    if seen:
-        logger.debug("session=%s delivered %s hits", session.session_id, seen)
+    return seen
 
 
 # ── main loop ────────────────────────────────────────────────────────
-async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: str) -> None:
-    """The background task for one job. Never raises."""
-    try:
+async def _plan_uploads(
+    session: CheckSession,
+    file_path: str,
+    file_name: str,
+) -> list[tuple[Shard, str, str]]:
+    """One (instance, file, name) per slice, or a single whole-file upload.
+
+    The upload is only cut when it can be cut exactly — every cookie lands in
+    one slice and none is dropped. Anything else (RAR, 7z, JSON, a damaged
+    archive) goes to one instance exactly as before.
+    """
+    shards = session.shard_list()
+    if len(shards) > 1:
         try:
-            submitted = await checker_api.submit_job_file(
-                api_url=session.api_url,
-                file_path=file_path,
-                file_name=file_name,
-                concurrency=config.settings.checker_concurrency,
-                rate_per_minute=config.settings.checker_rate_per_minute,
+            slices = await file_service.split_cookie_file(
+                file_path,
+                file_name,
+                chunk_size=config.settings.checker_shard_cookies,
+                max_shards=len(shards),
             )
-        except checker_api.CheckerAPIError as exc:
-            logger.error("job submit failed session=%s: %s", session.session_id, exc)
-            await _fail(bot, session, str(exc))
+        except Exception as exc:  # pragma: no cover - splitting is best effort
+            logger.warning("sharding failed session=%s: %s", session.session_id, exc)
+            slices = []
+        if slices:
+            uploads = [
+                (shard, item["file_path"], item["file_name"])
+                for shard, item in zip(shards, slices)
+            ]
+            for shard in shards[len(uploads):]:
+                shard.acquired = False
+                await api_manager.balancer.abandon(shard.api_id)
+            logger.info(
+                "session=%s sharded into %s slices across %s instances",
+                session.session_id, len(uploads), len(uploads),
+            )
+            return uploads
+
+    for shard in shards[1:]:
+        shard.acquired = False
+        await api_manager.balancer.abandon(shard.api_id)
+    return [(shards[0], file_path, file_name)]
+
+
+async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: str) -> None:
+    """The background task for one job. Never raises.
+
+    A big upload is cut into slices and every online instance checks one at
+    the same time; counters and hits of all slices are merged into this one
+    session, so the dashboard and the delivered bundle look like one run.
+    """
+    shards = session.shard_list()
+    chunk_files: list[str] = []
+    try:
+        uploads = await _plan_uploads(session, file_path, file_name)
+        chunk_files = [path for _, path, _ in uploads if path != file_path]
+
+        submitted = await asyncio.gather(
+            *[
+                checker_api.submit_job_file(
+                    api_url=shard.api_url,
+                    file_path=path,
+                    file_name=name,
+                    concurrency=config.settings.checker_concurrency,
+                    rate_per_minute=config.settings.checker_rate_per_minute,
+                )
+                for shard, path, name in uploads
+            ],
+            return_exceptions=True,
+        )
+
+        accepted = 0
+        for (shard, _, _), result in zip(uploads, submitted):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "job submit failed session=%s api=%s: %s",
+                    session.session_id, shard.api_id, result,
+                )
+                shard.state = "failed"
+                shard.acquired = False
+                await api_manager.balancer.abandon(shard.api_id)
+                continue
+            shard.job_id = str(result.get("job_id") or "")
+            shard.total = int(result.get("total") or 0)
+            shard.state = "running" if shard.job_id else "failed"
+            accepted += 1
+
+        if not accepted:
+            detail = str(submitted[0]) if submitted else "no checker accepted the job"
+            await _fail(bot, session, detail)
             return
 
-        session.job_id = str(submitted.get("job_id") or "")
-        session.total = int(submitted.get("total") or 0)
+        session.job_id = next(s.job_id for s in shards if s.job_id)
         session.stats.job_id = session.job_id
-        session.stats.total = session.total
+        _aggregate(session)
 
-        # The attempt is spent here: the API accepted the job.
+        # The attempt is spent here: at least one instance accepted a slice.
         if not await plan_service.deduct_attempt(session.user_id, session.plan):
             session.stats.status = "blocked"
-            await checker_api.cancel_job(session.api_url, session.job_id)
+            for shard in session.active_shards():
+                await checker_api.cancel_job(shard.api_url, shard.job_id)
             user = await plan_service.get_user(session.user_id)
             await _edit_to(
                 bot,
@@ -287,30 +416,19 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
 
         await _edit_live_card(bot, session, force=True)
 
-        transient = 0
+        cancelled = False
         while True:
             if api_manager.is_cancelled(session.session_id):
-                await checker_api.cancel_job(session.api_url, session.job_id)
-                session.stats.status = "cancelled"
+                cancelled = True
+                for shard in session.active_shards():
+                    await checker_api.cancel_job(shard.api_url, shard.job_id)
+                    shard.state = "cancelled"
                 break
 
-            try:
-                status = await checker_api.get_job_status(session.api_url, session.job_id)
-                transient = 0
-            except checker_api.CheckerAPIError as exc:
-                transient += 1
-                logger.warning(
-                    "status poll failed session=%s (%s/%s): %s",
-                    session.session_id, transient, TRANSIENT_RETRIES, exc,
-                )
-                if transient >= TRANSIENT_RETRIES:
-                    session.stats.status = "failed"
-                    await _fail(bot, session, "checker stopped responding")
-                    return
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+            for shard in list(session.active_shards()):
+                await _poll_shard(session, shard)
 
-            _apply_status(session, status)
+            _aggregate(session)
             # Fetch before drawing: a hit delivered on this sweep must already
             # be counted, otherwise the card shows it as free until the next
             # poll (three seconds later) repaints with the same numbers.
@@ -318,11 +436,18 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
             _split_counts(session)
             await _edit_live_card(bot, session)
 
-            state = str(status.get("status") or "running").lower()
-            if state in ("done", "cancelled", "failed"):
-                session.stats.status = state
+            if not any(shard.active for shard in shards):
                 break
             await asyncio.sleep(POLL_INTERVAL)
+
+        if cancelled:
+            session.stats.status = "cancelled"
+        elif any(shard.state == "done" for shard in shards):
+            session.stats.status = "done"
+        else:
+            session.stats.status = "failed"
+            await _fail(bot, session, "every checker instance failed")
+            return
 
         await _finalize(bot, session)
 
@@ -337,32 +462,94 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
         # finished state; failure and limit cards must not be overwritten.
         if session.stats.status in ("done", "cancelled"):
             await _finish_card(bot, session)
-        await api_manager.balancer.release(
-            session.api_id,
-            success=session.stats.status in ("done", "cancelled"),
-            final_cpm=session.stats.cpm,
-        )
+        for shard in shards:
+            if not shard.acquired:
+                continue
+            await api_manager.balancer.release(
+                shard.api_id,
+                success=shard.state in ("done", "cancelled"),
+                final_cpm=shard.cpm,
+            )
         api_manager.drop_session(session.session_id)
-        file_service.cleanup(file_path)
+        file_service.cleanup(file_path, *chunk_files)
         logger.info(
-            "session=%s closed status=%s checked=%s hits=%s",
-            session.session_id, session.stats.status, session.stats.checked, session.stats.hits,
+            "session=%s closed status=%s checked=%s hits=%s used=%s",
+            session.session_id,
+            session.stats.status,
+            session.stats.checked,
+            session.stats.hits,
+            len([s for s in shards if s.job_id]),
         )
 
 
-def _apply_status(session: CheckSession, status: dict[str, Any]) -> None:
-    """Fold one poll payload into the session counters."""
-    session.stats.checked = int(status.get("checked") or 0)
-    session.stats.api_hits = int(status.get("hits") or 0)
+async def _poll_shard(session: CheckSession, shard: Shard) -> None:
+    """One status poll for one slice; a dead instance retires its slice."""
+    try:
+        status = await checker_api.get_job_status(shard.api_url, shard.job_id)
+        shard.poll_failures = 0
+    except checker_api.CheckerAPIError as exc:
+        shard.poll_failures += 1
+        logger.warning(
+            "status poll failed session=%s api=%s (%s/%s): %s",
+            session.session_id, shard.api_id, shard.poll_failures, TRANSIENT_RETRIES, exc,
+        )
+        if shard.poll_failures >= TRANSIENT_RETRIES:
+            shard.state = "failed"
+        return
+
+    _apply_shard_status(shard, status)
+    state = str(status.get("status") or "running").lower()
+    if state in ("done", "cancelled", "failed"):
+        shard.state = state
+
+
+def _apply_shard_status(shard: Shard, status: dict[str, Any]) -> None:
+    """Fold one poll payload into that slice's counters."""
+    shard.checked = int(status.get("checked") or 0)
+    shard.hits = int(status.get("hits") or 0)
     # The Go API counts non-hits as "expired" and exposes RPM as "current_rpm".
-    session.stats.bad = int(status.get("expired") or status.get("bad") or 0)
-    session.stats.errors = int(status.get("errors") or 0)
-    session.stats.hold = int(status.get("hold") or 0)
-    session.stats.cpm = float(status.get("current_rpm") or status.get("cpm") or 0.0)
-    total = int(status.get("total") or session.stats.total or 0)
+    shard.bad = int(status.get("expired") or status.get("bad") or 0)
+    shard.errors = int(status.get("errors") or 0)
+    shard.hold = int(status.get("hold") or 0)
+    shard.cpm = float(status.get("current_rpm") or status.get("cpm") or 0.0)
+    total = int(status.get("total") or 0)
     if total:
-        session.stats.total = total
-        session.total = total
+        shard.total = total
+
+
+def _aggregate(session: CheckSession) -> None:
+    """Sum every slice into the counters the dashboard renders."""
+    shards = session.shard_list()
+    stats = session.stats
+    stats.total = sum(shard.total for shard in shards)
+    stats.checked = sum(shard.checked for shard in shards)
+    stats.api_hits = sum(shard.hits for shard in shards)
+    stats.bad = sum(shard.bad for shard in shards)
+    stats.errors = sum(shard.errors for shard in shards)
+    stats.hold = sum(shard.hold for shard in shards)
+    stats.cpm = sum(shard.cpm for shard in shards)
+    session.total = stats.total
+    _split_counts(session)
+
+
+def _apply_status(session: Any, status: dict[str, Any]) -> None:
+    """Fold one status payload into a one-slice session.
+
+    Works on anything carrying `stats` (the tests use a lightweight stand-in),
+    and is the single-shard view of what `_poll_shard` does per slice.
+    """
+    stats = session.stats
+    shard = Shard(api_id="", api_url="")
+    _apply_shard_status(shard, status)
+    stats.checked = shard.checked
+    stats.api_hits = shard.hits
+    stats.bad = shard.bad
+    stats.errors = shard.errors
+    stats.hold = shard.hold
+    stats.cpm = shard.cpm
+    if shard.total:
+        stats.total = shard.total
+        session.total = shard.total
     _split_counts(session)
 
 
@@ -446,28 +633,37 @@ async def _fail(bot: Bot, session: CheckSession, detail: str) -> None:
 # ── entry points used by handlers ────────────────────────────────────
 async def create_session(
     user: dict[str, Any],
-    api: dict[str, Any],
+    apis: list[dict[str, Any]],
     hit_mode: str,
     chat_id: int,
 ) -> CheckSession:
-    """Register a session and reserve a slot on its instance.
+    """Register a session and reserve a slot on every instance it may use.
 
     The handler sends the dashboard card next (so the checking video can be
-    embedded in it), fills `message_id`, then calls `launch`.
+    embedded in it), fills `message_id`, then calls `launch`. Instances that
+    end up unused are handed back by run_check before it finishes.
     """
+    if not apis:
+        raise ValueError("create_session needs at least one checker instance")
+
+    shards = [
+        Shard(api_id=str(api["api_id"]), api_url=str(api["url"])) for api in apis
+    ]
     session = CheckSession(
         session_id=new_session_id(),
         user_id=int(user["user_id"]),
         chat_id=chat_id,
         message_id=0,
-        api_id=str(api["api_id"]),
-        api_url=str(api["url"]),
+        api_id=shards[0].api_id,
+        api_url=shards[0].api_url,
         hit_mode=hit_mode,
         plan=str(user.get("plan") or "free"),
         stats=SessionStats(status="running"),
+        shards=shards,
     )
     api_manager.register_session(session.session_id, session)
-    await api_manager.balancer.acquire(session.api_id)
+    for shard in shards:
+        await api_manager.balancer.acquire(shard.api_id)
     return session
 
 
