@@ -89,6 +89,46 @@ async def _read_json(resp: aiohttp.ClientResponse) -> dict[str, Any]:
     return data
 
 
+# ── proxies ──────────────────────────────────────────────────────────
+async def refresh_proxies(
+    api_url: str,
+    target: int,
+    max_latency_ms: int = 1500,
+    max_candidates: int = 1200,
+    timeout: float = 150.0,
+) -> dict[str, Any]:
+    """POST /api/v1/proxies/refresh — harvest public lists and scan them.
+
+    The instance keeps `target` proxies that actually reached Netflix with a
+    low latency, in a tier that never displaces configured/paid proxies.
+    An instance built before this endpoint answers 404; callers treat that as
+    "no automatic proxies" and keep whatever pool it already holds.
+    """
+    payload = {
+        "target": max(1, int(target)),
+        "max_latency_ms": int(max_latency_ms),
+        "max_candidates": int(max_candidates),
+    }
+    try:
+        async with _get_session().post(
+            f"{_base(api_url)}{API_PREFIX}/proxies/refresh",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            if resp.status == 404:
+                raise CheckerAPIError(
+                    "instance has no /proxies/refresh route (redeploy it from main)"
+                )
+            body = await _read_json(resp)
+            if resp.status >= 400:
+                raise CheckerAPIError(
+                    str(body.get("error") or f"proxy refresh failed ({resp.status})")
+                )
+            return body
+    except aiohttp.ClientError as exc:
+        raise CheckerUnavailable(f"proxy refresh request failed: {exc}") from exc
+
+
 # ── jobs ─────────────────────────────────────────────────────────────
 async def submit_job_file(
     api_url: str,

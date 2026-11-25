@@ -46,13 +46,34 @@ CHECKER_CONCURRENCY = 50
 # Checks per minute per job. 0 = no rate limit.
 CHECKER_RATE_PER_MINUTE = 0
 
-# Cookie sharding: when more than one checker instance is online, the upload
-# is cut into ~1,000-cookie slices and each instance gets its own slice, so a
-# 4,500-cookie file is finished four times faster instead of queueing on one
-# box. Archives that cannot be cut safely are sent to a single instance.
-CHECKER_SHARD_COOKIES = 1000
+# Cookie splitting: a file stays on one instance until it holds more than
+# CHECKER_SPLIT_THRESHOLD cookies. Above it the file is cut into one equal slice
+# per online instance (at most CHECKER_MAX_SHARD_APIS), so 4,500 cookies become
+# four ~1,125-cookie slices checked in parallel. Archives that cannot be cut
+# safely are still sent to a single instance.
+CHECKER_SPLIT_THRESHOLD = 2000
 # Most instances one file may be spread across.
 CHECKER_MAX_SHARD_APIS = 4
+
+# ── proxy sizing ─────────────────────────────────────────────────────
+# One proxy is expected to carry about this many cookies in one run, so a slice
+# asks its instance for ceil(cookies / 500) proxies, capped per instance:
+#   <=500 -> 1, <=1000 -> 2, <=1500 -> 3, above that -> 4
+CHECKER_COOKIES_PER_PROXY = 500
+CHECKER_MAX_PROXIES_PER_API = 4
+# Workers per proxy. One IP hit by 300 concurrent checks is the fastest way to
+# get a whole batch flagged, so the bot asks for this many workers per proxy
+# instead of a flat CHECKER_CONCURRENCY whenever the proxy plan is in use.
+CHECKER_CONCURRENT_PER_PROXY = 15
+CHECKER_MAX_WORKERS_PER_API = 300
+
+# Before a job starts, ask each instance to top its pool up by harvesting
+# public proxy lists and scanning them against Netflix. Configured/paid proxies
+# are never replaced by this and always take priority in the pool.
+PROXY_AUTO_REFRESH = True
+PROXY_MAX_LATENCY_MS = 1500
+PROXY_MAX_CANDIDATES = 1200
+PROXY_REFRESH_TIMEOUT_SECONDS = 150
 
 # Instance selection when several checker APIs are online.
 API_ROTATION_MODE = "round_robin"  # round_robin | priority | random
@@ -98,8 +119,16 @@ class Settings:
     max_concurrent_global: int
     checker_concurrency: int
     checker_rate_per_minute: int
-    checker_shard_cookies: int
+    checker_split_threshold: int
     checker_max_shard_apis: int
+    cookies_per_proxy: int
+    max_proxies_per_api: int
+    concurrent_per_proxy: int
+    max_workers_per_api: int
+    proxy_auto_refresh: bool
+    proxy_max_latency_ms: int
+    proxy_max_candidates: int
+    proxy_refresh_timeout: int
     api_rotation_mode: str
     log_level: str
     log_json: bool
@@ -141,8 +170,16 @@ def load_settings() -> Settings:
         max_concurrent_global=MAX_CONCURRENT_GLOBAL,
         checker_concurrency=CHECKER_CONCURRENCY,
         checker_rate_per_minute=CHECKER_RATE_PER_MINUTE,
-        checker_shard_cookies=max(100, int(CHECKER_SHARD_COOKIES)),
+        checker_split_threshold=max(1, int(CHECKER_SPLIT_THRESHOLD)),
         checker_max_shard_apis=max(1, int(CHECKER_MAX_SHARD_APIS)),
+        cookies_per_proxy=max(1, int(CHECKER_COOKIES_PER_PROXY)),
+        max_proxies_per_api=max(1, int(CHECKER_MAX_PROXIES_PER_API)),
+        concurrent_per_proxy=max(1, int(CHECKER_CONCURRENT_PER_PROXY)),
+        max_workers_per_api=max(1, int(CHECKER_MAX_WORKERS_PER_API)),
+        proxy_auto_refresh=bool(PROXY_AUTO_REFRESH),
+        proxy_max_latency_ms=max(100, int(PROXY_MAX_LATENCY_MS)),
+        proxy_max_candidates=max(50, int(PROXY_MAX_CANDIDATES)),
+        proxy_refresh_timeout=max(5, int(PROXY_REFRESH_TIMEOUT_SECONDS)),
         api_rotation_mode=rotation,
         log_level=LOG_LEVEL.strip().upper(),
         log_json=LOG_JSON,

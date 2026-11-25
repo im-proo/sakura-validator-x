@@ -31,7 +31,7 @@ from models.schemas import (
     is_premium_hit,
     utcnow,
 )
-from services import file_service, plan_service
+from services import file_service, plan_service, proxy_policy
 from ui import keyboards, renderer
 from ui.states import LOADING_TEXT
 
@@ -305,6 +305,15 @@ async def _fetch_shard_hits(bot: Bot, session: CheckSession, shard: Shard) -> in
 
 
 # ── main loop ────────────────────────────────────────────────────────
+def _count_cookies(path: str, name: str) -> int:
+    """Cookie count of an upload or slice; 0 when it cannot be counted."""
+    try:
+        found = file_service.count_netflix_cookies(path, file_service.extension_of(name))
+    except Exception:  # pragma: no cover - counting is best effort
+        return 0
+    return int(found or 0)
+
+
 async def _plan_uploads(
     session: CheckSession,
     file_path: str,
@@ -317,12 +326,15 @@ async def _plan_uploads(
     archive) goes to one instance exactly as before.
     """
     shards = session.shard_list()
-    if len(shards) > 1:
+    total = _count_cookies(file_path, file_name)
+    # Small uploads stay on one instance: they fit one proxy pool and one log,
+    # and splitting them only multiplies the chance of a partial failure.
+    if len(shards) > 1 and total > config.settings.checker_split_threshold:
         try:
             slices = await file_service.split_cookie_file(
                 file_path,
                 file_name,
-                chunk_size=config.settings.checker_shard_cookies,
+                chunk_size=max(1, -(-total // len(shards))),
                 max_shards=len(shards),
             )
         except Exception as exc:  # pragma: no cover - splitting is best effort
@@ -348,6 +360,58 @@ async def _plan_uploads(
     return [(shards[0], file_path, file_name)]
 
 
+async def _prepare_proxies(
+    session: CheckSession,
+    uploads: list[tuple[Shard, str, str]],
+    plans: list[proxy_policy.ProxyPlan],
+) -> None:
+    """Ask every instance to top its proxy pool up to what its slice needs.
+
+    Best effort on purpose: an instance on an older build answers 404 and an
+    unreachable one raises, but either way the job still runs with whatever
+    pool the instance already holds. Paid/configured proxies are never
+    displaced by what this loads.
+    """
+    if not config.settings.proxy_auto_refresh:
+        return
+
+    wanted = [
+        (shard, plan)
+        for (shard, _, _), plan in zip(uploads, plans)
+        if getattr(shard, "api_url", "")
+    ]
+    if not wanted:
+        return
+
+    results = await asyncio.gather(
+        *[
+            checker_api.refresh_proxies(
+                shard.api_url,
+                target=plan.proxies,
+                max_latency_ms=config.settings.proxy_max_latency_ms,
+                max_candidates=config.settings.proxy_max_candidates,
+                timeout=float(config.settings.proxy_refresh_timeout),
+            )
+            for shard, plan in wanted
+        ],
+        return_exceptions=True,
+    )
+
+    for (shard, plan), result in zip(wanted, results):
+        if isinstance(result, BaseException):
+            logger.warning(
+                "proxy refresh session=%s api=%s: %s",
+                session.session_id, shard.api_id, result,
+            )
+            continue
+        logger.info(
+            "proxies session=%s api=%s target=%s loaded=%s alive=%s best_ms=%s cached=%s",
+            session.session_id, shard.api_id, plan.proxies,
+            result.get("loaded"), result.get("alive"),
+            result.get("best_latency_ms"), bool(result.get("cached")),
+        )
+
+
 async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: str) -> None:
     """The background task for one job. Never raises.
 
@@ -361,16 +425,26 @@ async def run_check(bot: Bot, session: CheckSession, file_path: str, file_name: 
         uploads = await _plan_uploads(session, file_path, file_name)
         chunk_files = [path for _, path, _ in uploads if path != file_path]
 
+        # Size the run before submitting: proxies per slice, workers per proxy,
+        # then let each instance harvest what it is short of.
+        plans = [
+            proxy_policy.plan_for(_count_cookies(path, name))
+            for _, path, name in uploads
+        ]
+        for plan in plans:
+            logger.info("session=%s plan: %s", session.session_id, plan.describe())
+        await _prepare_proxies(session, uploads, plans)
+
         submitted = await asyncio.gather(
             *[
                 checker_api.submit_job_file(
                     api_url=shard.api_url,
                     file_path=path,
                     file_name=name,
-                    concurrency=config.settings.checker_concurrency,
+                    concurrency=plan.workers,
                     rate_per_minute=config.settings.checker_rate_per_minute,
                 )
-                for shard, path, name in uploads
+                for (shard, path, name), plan in zip(uploads, plans)
             ],
             return_exceptions=True,
         )
